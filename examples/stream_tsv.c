@@ -30,6 +30,10 @@ static void on_alert(const char *group_key, const bishfpm_trigger_t *trigger,
 }
 
 int main(int argc, char **argv) {
+  if (argc > 3 || (argc == 3 && strcmp(argv[2], "--sensitive") != 0)) {
+    fprintf(stderr, "usage: %s [tsv_path [--sensitive]]\n", argv[0]);
+    return 1;
+  }
   const char *tsv_path = (argc > 1) ? argv[1] : "data/sample_checkout.tsv";
   FILE *fp = fopen(tsv_path, "r");
   if (!fp) {
@@ -37,8 +41,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  int sensitive = argc == 3;
+  char header[128];
+  if (fgets(header, sizeof(header), fp) &&
+      strcmp(header, "# bishfpm-profile: sensitive\n") == 0)
+    sensitive = 1;
+  rewind(fp);
+
   printf("bishfpm TSV Stream Ingestion\n");
   printf("Loading data file: %s\n", tsv_path);
+  printf("Threshold profile: %s\n", sensitive ? "sensitive" : "standard");
   printf("--------------------------------------------------\n");
 
   bishfpm_config_t cfg;
@@ -49,9 +61,16 @@ int main(int argc, char **argv) {
   cfg.promotion_fraction = 0.40;
   cfg.min_pattern_rate = 15.0;
   cfg.min_lift = 1.15;
+  if (sensitive) {
+    cfg.item_rate_threshold = 3.0;
+    cfg.item_share_threshold = 0.15;
+    cfg.promotion_fraction = 0.30;
+    cfg.min_pattern_rate = 6.0;
+    cfg.min_lift = 1.10;
+  }
   cfg.subsumption_ratio = 0.85;
   cfg.min_itemset_order = 2;
-  cfg.max_itemset_order = 3;
+  cfg.max_itemset_order = 4;
   cfg.topk_k = 1024;
   cfg.max_items_per_group = 2048;
   cfg.max_groups = 32;
