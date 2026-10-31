@@ -111,8 +111,9 @@ for language in c c++; do
       -I"$stage/usr/include" "-DEXPECT_VERSION=\"$version\"" "$stage/smoke.c" \
       -x none "$library" -lm -o "$stage/smoke"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/smoke"
+    # Keep executable checks active even if CC/CXX defines NDEBUG.
     run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
-      -I"$stage/usr/include" t/00util/test_lowlevel.c \
+      -UNDEBUG -I"$stage/usr/include" t/00util/test_lowlevel.c \
       -x none "$library" -lm -o "$stage/lowlevel"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/lowlevel"
   done

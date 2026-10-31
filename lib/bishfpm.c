@@ -228,6 +228,9 @@ static bool validate_pairs(const bishfpm_config_t *cfg,
     return false;
   if (!isfinite(pairs->forget_below) || pairs->forget_below < 0)
     return false;
+  /* validate the store layout even when dynamic budgeting defers allocation */
+  if (!compact_bytes(pairs->capacity, pairs->sketch_width, pairs->store))
+    return false;
 
   switch (pairs->store) {
   case BISHFPM_PAIR_SS:
@@ -440,6 +443,8 @@ void bishfpm_free(bishfpm_t *engine) {
 
 /* resize group hash table */
 static bool resize_groups(bishfpm_t *engine, size_t new_cap) {
+  if (!new_cap || new_cap > SIZE_MAX / sizeof(bishfpm_group_t))
+    return false;
   bishfpm_group_t *new_groups =
       memory_calloc(engine_budget(engine), new_cap, sizeof(bishfpm_group_t));
   if (!new_groups) {
@@ -687,8 +692,6 @@ static bool check_and_update_cooldown(bishfpm_group_t *grp, uint64_t hash,
   uint64_t ref_time = grp->max_time_ms;
   bool numeric = grp->pairs != NULL;
   size_t stride = cooldown_entry_size(numeric);
-  size_t mask = 2 * grp->cooldown_cap - 1;
-  uint32_t *index = cooldown_index(grp->cooldowns, grp->cooldown_cap, stride);
   bishfpm_cooldown_entry_t *existing = find_cooldown(grp, hash, identity);
   if (existing) {
     if (now_ms < existing->last_trigger_ms ||
@@ -742,8 +745,8 @@ static bool check_and_update_cooldown(bishfpm_group_t *grp, uint64_t hash,
       *saturated = true;
       return true;
     }
-    mask = 2 * grp->cooldown_cap - 1;
-    index = cooldown_index(grp->cooldowns, grp->cooldown_cap, stride);
+    size_t mask = 2 * grp->cooldown_cap - 1;
+    uint32_t *index = cooldown_index(grp->cooldowns, grp->cooldown_cap, stride);
     slot = cooldown_entry(grp->cooldowns, entry_index, stride)->hash & mask;
     while (index[slot] != entry_index + 1)
       slot = (slot + 1) & mask;
@@ -1579,7 +1582,10 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
     return 0;
   }
   bishfpm_group_t *new_groups =
-      memory_calloc(engine_budget(engine), new_cap, sizeof(bishfpm_group_t));
+      new_cap && new_cap <= SIZE_MAX / sizeof(bishfpm_group_t)
+          ? memory_calloc(engine_budget(engine), new_cap,
+                          sizeof(bishfpm_group_t))
+          : NULL;
   if (!new_groups) {
     size_t removed = engine_budget(engine)
                          ? prune_groups_in_place(engine, now_ms, min_rate)

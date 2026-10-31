@@ -92,6 +92,72 @@ static bishfpm_options_t dynamic(unsigned fss) {
                          fss ? 17U : 0U, BISHFPM_MEMORY_DYNAMIC};
   return o;
 }
+static void pair_configuration(void) {
+  bishfpm_config_t c;
+  bishfpm_config_default(&c);
+  c.min_itemset_order = c.max_itemset_order = 2;
+  c.item_rate_threshold = c.item_share_threshold = 0;
+  c.max_groups = 1;
+  c.max_items_per_group = c.max_event_items = 16;
+  c.topk_k = 8;
+  c.max_memory_bytes = 1U << 20;
+  const uint32_t invalid_capacities[] = {0, (1U << 28) + 1, UINT32_MAX};
+  const uint32_t invalid_fss_widths[] = {0, (1U << 24) + 1, UINT32_MAX};
+  const char *items[] = {"a", "b"};
+  for (unsigned mode = 0; mode < 2; mode++) {
+    bishfpm_options_t o;
+    bishfpm_options_default(&o);
+    o.memory_mode = mode ? BISHFPM_MEMORY_DYNAMIC : BISHFPM_MEMORY_CONSERVATIVE;
+    for (int kind = BISHFPM_PAIR_SS; kind <= BISHFPM_PAIR_FSS; kind++) {
+      bishfpm_pair_options_t p = {(bishfpm_pair_store_t)kind, 16,
+                                  kind == BISHFPM_PAIR_FSS ? 17U : 0U, .1};
+      bishfpm_t *e = bishfpm_create_pairs_with_options(&c, &p, &o);
+      assert(e);
+      assert(bishfpm_add_event(e, "g", 1, items, 2, NULL, NULL) >= 0);
+      if (mode)
+        audit(e);
+      bishfpm_free(e);
+      clean();
+      for (size_t i = 0;
+           i < sizeof(invalid_capacities) / sizeof(invalid_capacities[0]);
+           i++) {
+        p.capacity = invalid_capacities[i];
+        assert(!bishfpm_create_pairs_with_options(&c, &p, &o));
+        clean();
+      }
+      p.capacity = 16;
+      if (kind == BISHFPM_PAIR_FSS) {
+        for (size_t i = 0;
+             i < sizeof(invalid_fss_widths) / sizeof(invalid_fss_widths[0]);
+             i++) {
+          p.sketch_width = invalid_fss_widths[i];
+          assert(!bishfpm_create_pairs_with_options(&c, &p, &o));
+          clean();
+        }
+      } else {
+        p.sketch_width = 1;
+        assert(!bishfpm_create_pairs_with_options(&c, &p, &o));
+        clean();
+      }
+    }
+  }
+  /* legal large stores remain deferred in dynamic mode, even above the cap */
+  bishfpm_options_t o = dynamic(0);
+  bishfpm_pair_options_t p = {BISHFPM_PAIR_FSS, 1, 1U << 24, .1};
+  bishfpm_t *e = bishfpm_create_pairs_with_options(&c, &p, &o);
+  assert(e);
+  audit(e);
+  bishfpm_free(e);
+  clean();
+#if PTRDIFF_MAX > INT32_MAX
+  p = (bishfpm_pair_options_t){BISHFPM_PAIR_SS, 1U << 28, 0, .1};
+  e = bishfpm_create_pairs_with_options(&c, &p, &o);
+  assert(e);
+  audit(e);
+  bishfpm_free(e);
+  clean();
+#endif
+}
 static void growth_and_denial(void) {
   bishfpm_config_t c = config();
   c.max_memory_bytes = 128U << 10;
@@ -332,6 +398,7 @@ static void injected_failures(void) {
   }
 }
 int main(void) {
+  pair_configuration();
   growth_and_denial();
   group_tables_and_pruning(0);
   group_tables_and_pruning(1);

@@ -138,13 +138,19 @@ static void prune_cooldowns(void) {
   assert(e);
   const char *ab[] = {"a", "b"};
   assert(bishfpm_add_event(e, "g", 1000, ab, 2, NULL, NULL) == 1);
+  assert(!resize_groups(e, 0));
+  assert(!resize_groups(e, SIZE_MAX / sizeof(bishfpm_group_t) + 1));
+  /* force pruning to shrink the table and relocate the surviving group */
+  assert(resize_groups(e, e->group_cap * 2));
   bishfpm_group_t *g = find_group(e, "g", NULL);
   assert(g && g->cooldown_count == 1);
   assert(bishfpm_prune(e, 1050, .01) == 0);
-  assert(g->cooldown_count == 1);
+  g = find_group(e, "g", NULL);
+  assert(g && g->cooldown_count == 1);
   assert(bishfpm_add_event(e, "g", 1050, ab, 2, NULL, NULL) == 0);
   assert(bishfpm_prune(e, 1100, .01) == 0);
-  assert(g->cooldown_count == 0);
+  g = find_group(e, "g", NULL);
+  assert(g && g->cooldown_count == 0);
   assert(bishfpm_add_event(e, "g", 1100, ab, 2, NULL, NULL) == 1);
   bishfpm_free(e);
 }

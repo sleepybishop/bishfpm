@@ -189,6 +189,9 @@ shown above before using normal build targets.
 
 `examples/stream_tsv` reads timestamp (seconds), group, and 1–32 item columns.
 Sample streams are in `data/`.
+The example schedules pruning only after accepted records, so rejected timestamps
+cannot expire valid history. Applications that need to reclaim capacity while
+ingestion is blocked must schedule maintenance independently before retrying.
 
 ## Validation
 

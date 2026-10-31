@@ -11,6 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make -j2 ci CC=${{ matrix.cc }} CFLAGS='-O2 -g -std=c11 -Wall -Wextra -Werror'
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # CC/CXX also exercise installed consumers with assertions disabled by callers.
+      - run: make -j2 ci CC='gcc -DNDEBUG' CXX='g++ -DNDEBUG' CFLAGS='-O2 -g -std=c11 -Wall -Wextra -Werror -DNDEBUG'
   sanitizers:
     runs-on: ubuntu-24.04
     steps:

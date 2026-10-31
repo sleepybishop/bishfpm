@@ -120,6 +120,15 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    int rc = bishfpm_add_event(engine, group, time_ms, items, n_items, on_alert,
+                               NULL);
+    if (rc < 0) {
+      rejected++;
+      continue;
+    }
+    line_count++;
+
+    /* rejected records must not advance maintenance or burst bookkeeping */
     if (is_burst_item) {
       if (first_burst_sec < 0.0) {
         first_burst_sec = time_sec;
@@ -127,19 +136,12 @@ int main(int argc, char **argv) {
       last_burst_sec = time_sec;
     }
 
-    if (time_ms >= last_prune_ms + prune_interval_ms) {
+    if (time_ms >= last_prune_ms &&
+        time_ms - last_prune_ms >= prune_interval_ms) {
       if (last_prune_ms > 0) {
         bishfpm_prune(engine, time_ms, prune_min_rate);
       }
       last_prune_ms = time_ms;
-    }
-
-    int rc = bishfpm_add_event(engine, group, time_ms, items, n_items, on_alert,
-                               NULL);
-    if (rc >= 0) {
-      line_count++;
-    } else {
-      rejected++;
     }
   }
 

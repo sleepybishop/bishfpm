@@ -5,6 +5,8 @@
  * FSS pays for its sketch by using a smaller resident capacity. */
 #include "bishfpm.h"
 #include "bishfpm_lowlevel.h"
+/* keep assertion checks active even in direct release builds */
+#undef NDEBUG
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>

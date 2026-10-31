@@ -59,17 +59,18 @@ libbishfpm.a: $(CORE_OBJ)
 lib/%.o: lib/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+# Assertions execute test and benchmark checks, even with release library flags.
 t/00util/test_rejections: t/00util/test_rejections.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
 
 t/00util/test_dynamic: t/00util/test_dynamic.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup,--wrap=free $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup,--wrap=free $(LDLIBS) -UNDEBUG -o $@
 
 t/00util/test_pressure: t/00util/test_pressure.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=calloc $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=calloc $(LDLIBS) -UNDEBUG -o $@
 
 t/00util/%: t/00util/%.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
 
 examples/%: examples/%.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@
@@ -142,7 +143,7 @@ sanitize:
 
 build/fuzz_stream: t/fuzz_stream.c $(wildcard lib/*.c) $(wildcard include/*.h) $(wildcard lib/*.h)
 	mkdir -p build
-	clang $(CPPFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined,float-cast-overflow -fno-omit-frame-pointer t/fuzz_stream.c lib/*.c -lm -o $@
+	clang $(CPPFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined,float-cast-overflow -fno-omit-frame-pointer t/fuzz_stream.c lib/*.c -lm -UNDEBUG -o $@
 
 fuzz-smoke: build/fuzz_stream
 	mkdir -p build/corpus
