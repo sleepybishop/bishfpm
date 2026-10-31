@@ -5,7 +5,7 @@
 
 int main(void) {
   /* test top-k with capacity 4 */
-  bishfpm_topk_t *topk = bishfpm_topk_new(4, 4, 128, 5000.0, 0.95);
+  bishfpm_topk_t *topk = bishfpm_topk_new(4, 5000.0);
   assert(topk != NULL);
 
   /* stream items */
@@ -22,7 +22,10 @@ int main(void) {
   bishfpm_topk_update(topk, "pattern_rare2", 1000);
 
   /* get top 4 */
-  bishfpm_heap_item_t items[4];
+  assert(bishfpm_topk_count(topk) == 4);
+  assert(bishfpm_topk_min_rate(topk, 1300) > 0.0);
+
+  bishfpm_topk_item_t items[4];
   size_t n = bishfpm_topk_get_top(topk, 1300, items, 4);
   assert(n == 4);
 
@@ -35,7 +38,7 @@ int main(void) {
   /* test arena backed top-k */
   bishfpm_arena_t *a = bishfpm_arena_new(64 * 1024);
   assert(a != NULL);
-  bishfpm_topk_t *topk_a = bishfpm_topk_new_arena(a, 4, 4, 128, 5000.0, 0.95);
+  bishfpm_topk_t *topk_a = bishfpm_topk_new_arena(a, 4, 5000.0);
   assert(topk_a != NULL);
 
   for (int i = 0; i < 15; i++) {
@@ -43,6 +46,12 @@ int main(void) {
   }
   double r = bishfpm_topk_query(topk_a, "arena_test", 1150);
   assert(r >= 10.0);
+
+  /* test batch add with large increment without repeated pow calls */
+  double r_batch = bishfpm_topk_add(topk_a, "batch_pattern", 50, 1200);
+  assert(r_batch >= 50.0);
+  double r_coll = bishfpm_topk_add(topk_a, "colliding_noise", 30, 1200);
+  assert(r_coll >= 1.0);
 
   bishfpm_arena_free(a);
   bishfpm_topk_free(topk);
