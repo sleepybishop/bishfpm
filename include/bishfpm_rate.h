@@ -28,7 +28,8 @@ double bishfpm_rate_update_weighted(bishfpm_rate_t *r, uint64_t now_ms,
 double bishfpm_rate_query(const bishfpm_rate_t *r, uint64_t now_ms,
                           double half_life_ms);
 
-/* Reserve distinct keys atomically; newly reserved counters start at zero. */
+/* Callers must supply distinct keys; duplicates are rejected atomically.
+ * Newly reserved counters start at zero. */
 bool bishfpm_rate_table_prepare(bishfpm_rate_table_t *, const char *const *,
                                 size_t);
 

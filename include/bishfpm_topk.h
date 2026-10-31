@@ -34,7 +34,9 @@ void bishfpm_topk_set_seed(bishfpm_topk_t *topk, uint64_t seed);
 double bishfpm_topk_update(bishfpm_topk_t *topk, const char *pattern,
                            uint64_t now_ms);
 
-/* Add a finite nonnegative weight, discounted to the store watermark. */
+/* Add a finite nonnegative weight, discounted to the store watermark.
+ * Returns the upper estimate. Invalid input or count overflow returns zero
+ * without changing the store. Zero weight queries without advancing time. */
 double bishfpm_topk_add_weight(bishfpm_topk_t *, const char *, double,
                                uint64_t);
 

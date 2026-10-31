@@ -35,6 +35,42 @@ int main(void) {
   assert(bishfpm_rate_table_count(table) == 0);
   bishfpm_rate_table_free(table);
 
+  /* Duplicate batches are invalid even if some keys already exist. Rejection
+   * must not publish earlier new keys or consume the distinct-key budget. */
+  table = bishfpm_rate_table_new_configured(16, 2, 42);
+  assert(table);
+  const char *duplicates[] = {"new", "new"};
+  assert(!bishfpm_rate_table_prepare(table, duplicates, 2));
+  assert(bishfpm_rate_table_count(table) == 0);
+  assert(bishfpm_rate_table_update(table, "a", 1000, 1000) == 1);
+  const char *mixed[] = {"new", "a", "a"};
+  assert(!bishfpm_rate_table_prepare(table, mixed, 3));
+  assert(bishfpm_rate_table_count(table) == 1);
+  const char *distinct[] = {"a", "b"};
+  assert(bishfpm_rate_table_prepare(table, distinct, 2));
+  assert(bishfpm_rate_table_count(table) == 2);
+  assert(bishfpm_rate_table_update(table, "b", 1000, 1000) == 1);
+  /* No-removal pruning must not backdate a later counter. */
+  assert(bishfpm_rate_table_prune(table, 0, 1000, .1) == 0);
+  assert(bishfpm_rate_table_query(table, "a", 2000, 1000) == .5);
+  assert(bishfpm_rate_table_prune(table, 2000, 1000, .1) == 0);
+  assert(bishfpm_rate_table_query(table, "b", 3000, 1000) == .25);
+  bishfpm_rate_table_free(table);
+
+  /* Equal-rate truncation uses canonical pattern order across insertion orders.
+   */
+  for (int reverse = 0; reverse < 2; reverse++) {
+    bishfpm_topk_t *ties = bishfpm_topk_new(3, 1000);
+    assert(ties);
+    const char *names[] = {"a", "b", "c"};
+    for (int i = 0; i < 3; i++)
+      assert(bishfpm_topk_add(ties, names[reverse ? 2 - i : i], 1, 0) == 1);
+    bishfpm_topk_item_t top[2];
+    assert(bishfpm_topk_get_top(ties, 1000, top, 2) == 2);
+    assert(!strcmp(top[0].pattern, "a") && !strcmp(top[1].pattern, "b"));
+    bishfpm_topk_free(ties);
+  }
+
   unsigned char buffer[4096];
   bishfpm_arena_t *arena = bishfpm_arena_new_buffer(buffer, sizeof(buffer));
   assert(arena);

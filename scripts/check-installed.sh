@@ -57,19 +57,23 @@ int main(void) {
 }
 C
 version=$(PKG_CONFIG_LIBDIR="$stage/usr/lib/pkgconfig" pkg-config --modversion bishfpm)
+run_compiler() {
+  # CC/CXX are shell commands, as in make; keep consumer arguments positional.
+  sh -c "$compiler \"\$@\"" bishfpm-compiler "$@"
+}
 for language in c c++; do
   if [ "$language" = c ]; then compiler=${CC:-cc}; standard=c11
   else compiler=${CXX:-c++}; standard=c++11; fi
   # Each installed header must stand on its own in either language.
   for header in "$stage"/usr/include/*.h; do
     printf '#include <%s>\nint main(void){return 0;}\n' "$(basename "$header")" > "$stage/header.c"
-    "$compiler" -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
       -I"$stage/usr/include" -fsyntax-only "$stage/header.c"
   done
   # The public handles deliberately have no visible storage layout.
   for handle in bishfpm_t bishfpm_rate_t bishfpm_rate_table_t bishfpm_topk_t bishfpm_arena_t bishfpm_pair_counter_t; do
     printf '#include <bishfpm.h>\n#include <bishfpm_lowlevel.h>\nint main(void){return sizeof(%s);}\n' "$handle" > "$stage/opaque.c"
-    if "$compiler" -x "$language" -std="$standard" -I"$stage/usr/include" \
+    if run_compiler -x "$language" -std="$standard" -I"$stage/usr/include" \
         -fsyntax-only "$stage/opaque.c" > "$stage/opaque.log" 2>&1; then
       printf 'Public storage unexpectedly exposed for %s\n' "$handle" >&2
       exit 1
@@ -78,11 +82,11 @@ for language in c c++; do
   for linkage in static shared; do
     if [ "$linkage" = static ]; then library="$stage/usr/lib/libbishfpm.a"
     else library="$stage/usr/lib/libbishfpm.so"; fi
-    "$compiler" -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
       -I"$stage/usr/include" "-DEXPECT_VERSION=\"$version\"" "$stage/smoke.c" \
       -x none "$library" -lm -o "$stage/smoke"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/smoke"
-    "$compiler" -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
       -I"$stage/usr/include" t/00util/test_lowlevel.c \
       -x none "$library" -lm -o "$stage/lowlevel"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/lowlevel"

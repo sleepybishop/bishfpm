@@ -63,6 +63,7 @@ typedef struct {
   bool present, was_present, replaced;
   double upper, lower, error;
   uint64_t time_ms;
+  uint64_t hash; /* Cached text-pattern hash for valid string-store inputs. */
 } topk_result_t;
 
 /* Internal helpers are not part of the installed/shared-library interface. */
@@ -75,6 +76,10 @@ BISHFPM_PRIVATE topk_result_t topk_query_result(const bishfpm_topk_t *,
                                                 const char *, uint64_t);
 BISHFPM_PRIVATE topk_result_t topk_add_result(bishfpm_topk_t *, const char *,
                                               double, uint64_t);
+/* Requires a validated nonempty pattern of length < BISHFPM_TOPK_MAX_STR,
+ * a valid store, and finite nonnegative weight. */
+BISHFPM_PRIVATE topk_result_t topk_add_sized(bishfpm_topk_t *, const char *,
+                                             size_t, double, uint64_t);
 BISHFPM_PRIVATE bishfpm_rate_entry_t *
 rate_table_find(const bishfpm_rate_table_t *, const char *, uint64_t);
 /* Distinguish capacity rejection from failed allocation without a second scan.

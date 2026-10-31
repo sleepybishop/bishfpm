@@ -1,4 +1,5 @@
 #include "bishfpm.h"
+#include "bishfpm_rate.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -7,10 +8,12 @@
 
 /* Fail actual allocation sites, after engine construction. */
 static size_t fail_after = SIZE_MAX;
+static size_t allocation_attempts;
 void *__real_malloc(size_t);
 void *__real_calloc(size_t, size_t);
 char *__real_strdup(const char *);
 static int fail(void) {
+  allocation_attempts++;
   if (fail_after == SIZE_MAX)
     return 0;
   if (!fail_after)
@@ -131,6 +134,9 @@ static void numeric_failures(void) {
         if (rc < 0) {
           failures++;
           assert(snapshot(a).allocation_failure == 1);
+          bishfpm_stats_t budget;
+          bishfpm_get_stats(a, &budget);
+          assert(budget.budget_rejections == 0);
           same_counts(a, b, keys, 34);
           /* A late retry makes an incorrectly advanced watermark observable. */
           assert(bishfpm_add_event(a, "g", 101, keys + 32, 2, NULL, NULL) >= 0);
@@ -149,7 +155,50 @@ static void numeric_failures(void) {
     assert(failures >= 8);
   }
 }
+static void allocation_free_prune(void) {
+  bishfpm_rate_table_t *table = bishfpm_rate_table_new(16);
+  assert(table);
+  assert(bishfpm_rate_table_update(table, "a", 1000, 1000) == 1);
+  size_t attempts = allocation_attempts;
+  fail_after = 0;
+  assert(bishfpm_rate_table_prune(table, 2000, 1000, .1) == 0);
+  fail_after = SIZE_MAX;
+  assert(allocation_attempts == attempts);
+  assert(bishfpm_rate_table_query(table, "a", 2000, 1000) == .5);
+  bishfpm_rate_table_free(table);
+
+  bishfpm_config_t c;
+  bishfpm_config_default(&c);
+  c.item_rate_threshold = 0;
+  c.min_pattern_rate = c.promotion_fraction = 0;
+  c.ewma_half_life_ms = 1000;
+  c.trigger_cooldown_ms = 0;
+  bishfpm_t *e = create(&c);
+  const char *ab[] = {"a", "b"};
+  assert(bishfpm_add_event(e, "g", 0, ab, 2, NULL, NULL) >= 0);
+  /* Warm up marginal compaction, then populate a stronger group count. */
+  assert(bishfpm_prune(e, 0, .1) == 0);
+  const char *a[] = {"a"};
+  assert(bishfpm_add_event_weighted(e, "g", 1000, a, 1, 10, NULL, NULL) >= 0);
+  fail_after = 0;
+  assert(bishfpm_prune(e, 1000, 1) == 0);
+  fail_after = SIZE_MAX;
+  assert(bishfpm_pattern_rate(e, "g", "a\037b", 1000) == 0);
+  bishfpm_stats_t stats;
+  bishfpm_get_stats(e, &stats);
+  assert(stats.items_pruned ==
+         0); /* Marginal deletion still needs rehash storage. */
+  assert(bishfpm_group_rate(e, "g", 1000) == 10.5);
+  size_t before_bytes = stats.memory_current_bytes;
+  assert(bishfpm_prune(e, 1000, 1) == 0);
+  bishfpm_get_stats(e, &stats);
+  assert(stats.items_pruned == 1);
+  assert(stats.memory_current_bytes == before_bytes - sizeof("b"));
+  bishfpm_free(e);
+}
+
 int main(void) {
+  allocation_free_prune();
   bishfpm_config_t c;
   bishfpm_config_default(&c);
   c.max_groups = 1;
@@ -175,6 +224,9 @@ int main(void) {
   bishfpm_rejection_stats_t r = snapshot(e);
   assert(r.invalid_input == 3 && r.event_items_limit == 1 &&
          r.candidate_limit == 1 && r.marginal_limit == 1 && r.group_limit == 1);
+  bishfpm_stats_t budget;
+  bishfpm_get_stats(e, &budget);
+  assert(budget.budget_rejections == 4);
   bishfpm_rejection_stats_t unchanged = r;
   bishfpm_get_rejection_stats(NULL, &unchanged);
   assert(!memcmp(&r, &unchanged, sizeof(r)));
@@ -228,6 +280,7 @@ int main(void) {
         bishfpm_stats_t s;
         bishfpm_get_stats(e, &s);
         assert(s.active_groups == (size_t)(existing > 0));
+        assert(s.budget_rejections == 0);
         assert(bishfpm_item_rate(e, "g", "a", 1) == 0);
         assert(bishfpm_add_event(e, "g", 1, ab, 2, NULL, NULL) >= 0);
         assert(snapshot(e).allocation_failure == 1);

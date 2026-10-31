@@ -94,15 +94,6 @@ static void slot_map_rebuild(compact_t *store) {
     slot_map_set(store, store->heap[i].hash, i);
 }
 
-static void heap_swap(compact_t *store, uint32_t i, uint32_t j) {
-  size_t si = slot_for_index(store, i), sj = slot_for_index(store, j);
-  compact_entry_t tmp = store->heap[i];
-  store->heap[i] = store->heap[j];
-  store->heap[j] = tmp;
-  store->slot_map[si] = j + 1;
-  store->slot_map[sj] = i + 1;
-}
-
 static inline double item_rate(const compact_entry_t *item, uint64_t now_ms,
                                double half_life_ms) {
   if (now_ms <= item->last_time_ms) {
@@ -113,17 +104,21 @@ static inline double item_rate(const compact_entry_t *item, uint64_t now_ms,
 }
 
 static void heapify_up(compact_t *store, uint32_t idx, uint64_t now_ms) {
-  while (idx > 0) {
-    uint32_t parent = (idx - 1) / 2;
-    double r_cur = item_rate(&store->heap[idx], now_ms, store->half_life_ms);
-    double r_par = item_rate(&store->heap[parent], now_ms, store->half_life_ms);
-    if (r_cur < r_par) {
-      heap_swap(store, idx, parent);
-      idx = parent;
-    } else {
+  compact_entry_t held = store->heap[idx];
+  size_t held_slot = slot_for_index(store, idx);
+  double rate = item_rate(&held, now_ms, store->half_life_ms);
+  uint32_t hole = idx;
+  while (hole > 0) {
+    uint32_t parent = (hole - 1) / 2;
+    if (!(rate < item_rate(&store->heap[parent], now_ms, store->half_life_ms)))
       break;
-    }
+    size_t slot = slot_for_index(store, parent);
+    store->heap[hole] = store->heap[parent];
+    store->slot_map[slot] = hole + 1;
+    hole = parent;
   }
+  store->heap[hole] = held;
+  store->slot_map[held_slot] = hole + 1;
 }
 
 static void heapify_down(compact_t *store, uint32_t idx, uint64_t now_ms) {
@@ -324,17 +319,16 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
   } else {
     idx = t->heap_size++;
   }
-  /* Read bucket history even when reusing a free slot after pruning. */
-  error = fss_alpha(t, hash, now);
+  /* The staged error already includes bucket history and any eviction. */
   t->heap[idx] = (compact_entry_t){
       .key = key, .rate = error + weight, .error = error, .last_time_ms = now};
   t->heap[idx].hash = hash;
   slot_map_set(t, hash, idx);
   r.present = true;
   r.replaced = full;
-  r.lower = weight;
-  r.upper = error + weight;
-  r.error = error;
+  r.upper = t->heap[idx].rate;
+  r.lower = fmax(0, r.upper - error);
+  r.error = r.upper - r.lower;
   if (full)
     heapify_down(t, idx, now);
   else
@@ -355,11 +349,8 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
   now_ms = effective_time(timestamp, store->max_time_ms);
   double weight =
       bishfpm_rate_decay(increment, now_ms - timestamp, store->half_life_ms);
-  if (now_ms > store->max_time_ms) {
-    store->omitted_bound = bishfpm_rate_decay(
-        store->omitted_bound, now_ms - store->max_time_ms, store->half_life_ms);
-    store->max_time_ms = now_ms;
-  }
+  double omitted_bound = bishfpm_rate_decay(
+      store->omitted_bound, now_ms - store->max_time_ms, store->half_life_ms);
   result.time_ms = now_ms;
   uint32_t idx;
   if (slot_map_find(store, key, hash, &idx)) {
@@ -368,6 +359,8 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
     double decayed = item_rate(item, now_ms, store->half_life_ms);
     if (weight > DBL_MAX - decayed)
       return result;
+    store->omitted_bound = omitted_bound;
+    store->max_time_ms = now_ms;
     item->error = bishfpm_rate_decay(item->error, now_ms - item->last_time_ms,
                                      store->half_life_ms);
     item->rate = decayed + weight;
@@ -385,9 +378,11 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
     return result;
   double error = replacing
                      ? item_rate(&store->heap[0], now_ms, store->half_life_ms)
-                     : store->omitted_bound;
+                     : omitted_bound;
   if (weight > DBL_MAX - error)
     return result;
+  store->omitted_bound = omitted_bound;
+  store->max_time_ms = now_ms;
 
   if (replacing) {
     idx = 0;

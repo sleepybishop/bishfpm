@@ -29,25 +29,29 @@ extern "C" {
 #define BISHFPM_DEFAULT_MAX_ITEMS_PER_GROUP 1024
 #define BISHFPM_DEFAULT_HASH_SEED 0
 
-/* configuration parameters */
+/* Configuration parameters. Floating-point fields must be finite.
+ * Count thresholds and min_lift must be nonnegative; shares and
+ * subsumption_ratio must be in [0, 1]. When min_pattern_rate is positive,
+ * item_rate_threshold must not exceed it. Capacity and work limits must be
+ * positive and within the ranges below; the conservative payload bound must
+ * fit max_memory_bytes. */
 typedef struct {
-  double ewma_half_life_ms;    /* half-life for continuous decay */
-  double item_rate_threshold;  /* item rate to trigger elevation */
-  double item_share_threshold; /* min fraction of group rate for item gating
+  double ewma_half_life_ms;    /* positive half-life for continuous decay */
+  double item_rate_threshold;  /* minimum decayed item count for gating */
+  double item_share_threshold; /* min fraction of group count for item gating
                                   (0.0 to disable) */
-  double promotion_fraction;   /* alpha: fraction of group rate for promotion */
-  double min_pattern_rate;     /* absolute minimum rate for promotion */
+  double promotion_fraction;   /* minimum pattern lower-count / group count */
+  double min_pattern_rate;     /* minimum decayed pattern lower count */
   double min_lift; /* min statistical lift for combination alert (0.0 to
                       disable) */
-  double subsumption_ratio; /* max rate drop for superset alerts vs active
-                               subset (0.0 to disable) */
-  uint32_t
-      min_itemset_order; /* min size of candidate pattern to trigger (e.g. 2) */
-  uint32_t max_itemset_order; /* max size of candidate combinations (e.g. 3) */
-  uint32_t topk_k;            /* number of heavy hitters to track per group */
+  double subsumption_ratio;   /* suppress when candidate lower count < ratio *
+                                 active subset lower count (0.0 to disable) */
+  uint32_t min_itemset_order; /* 1..max_itemset_order */
+  uint32_t max_itemset_order; /* at most BISHFPM_MAX_ITEMSET_ORDER */
+  uint32_t topk_k; /* 1..1000000; general-store capacity and cooldown sizing */
   uint64_t trigger_cooldown_ms; /* cooldown before re-triggering same pattern */
-  uint32_t max_groups;          /* positive maximum groups to track */
-  uint32_t max_items_per_group; /* positive maximum items per group */
+  uint32_t max_groups;          /* 1..65536 groups */
+  uint32_t max_items_per_group; /* 1..1048576 items per group */
   uint64_t hash_seed;           /* hash seed for partitioning (0 = default) */
   uint32_t max_event_items; /* input pointer count, default 256, at most 4096 */
   uint32_t max_candidates_per_event; /* worst-case subset budget, default 8192;
@@ -97,13 +101,13 @@ typedef struct {
   char formatted[BISHFPM_MAX_PATTERN_LEN]; /* human readable comma-separated
                                               string */
   double pattern_rate;        /* conservative decayed pattern count */
-  double pattern_upper_bound; /* resident SpaceSaving upper estimate */
+  double pattern_upper_bound; /* decayed pattern upper bound */
   double pattern_error;       /* upper minus conservative pattern_rate */
-  double group_rate;          /* current total group rate */
+  double group_rate;          /* current decayed group count */
   double rate_fraction;       /* pattern_rate / group_rate */
   double lift;                /* statistical lift of pattern */
   uint32_t item_count;        /* number of items in pattern */
-  uint64_t timestamp;         /* timestamp of triggering event */
+  uint64_t timestamp;         /* effective group time in milliseconds */
 } bishfpm_trigger_t;
 
 /* callback for triggered patterns */
@@ -117,14 +121,17 @@ typedef struct bishfpm bishfpm_t;
 /* initialize default config */
 void bishfpm_config_default(bishfpm_config_t *cfg);
 
-/* engine lifecycle */
+/* Engine lifecycle. Constructors return NULL for invalid configuration,
+ * an excessive conservative payload bound, or allocation failure.
+ * bishfpm_create(NULL) uses defaults. */
 bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg);
 /* Opt-in numeric pair backends; cfg must have min/max itemset order 2.
  * IDs persist for a group's lifetime: marginal keys are retained across prune.
  * capacity bounds pair identities independently of topk_k (notification state).
- * THRESHOLD requires disabled marginal gates. It only forgets patterns whose
- * upper bound <= forget_below; saturation rejects the whole event before count
- * mutation. No offline prepass or future vocabulary is used. */
+ * THRESHOLD requires disabled marginal gates. In surviving groups it only
+ * forgets patterns whose upper bound <= forget_below; saturation rejects the
+ * whole event before count mutation. No offline prepass or future vocabulary
+ * is used. */
 typedef enum {
   BISHFPM_PAIR_SS = 0,
   BISHFPM_PAIR_THRESHOLD = 1,
@@ -133,10 +140,10 @@ typedef enum {
 } bishfpm_pair_store_t;
 typedef struct {
   bishfpm_pair_store_t store;
-  uint32_t capacity;
+  uint32_t capacity;     /* 1..2^28 pairs, subject to the memory budget */
   uint32_t sketch_width; /* FSS bucket count, 1..2^24; zero for SS/threshold */
-  double forget_below;   /* bounded-prune cutoff; threshold also uses it on
-                            ingestion */
+  double forget_below;   /* finite, nonnegative bounded-prune cutoff;
+                            threshold also uses it on ingestion */
 } bishfpm_pair_options_t;
 bishfpm_t *bishfpm_create_pairs(const bishfpm_config_t *,
                                 const bishfpm_pair_options_t *);
@@ -175,15 +182,17 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
                                size_t num_items, uint32_t weight,
                                bishfpm_trigger_cb cb, void *udata);
 
-/* query current group rate */
+/* Query decayed group count at now_ms, clamped to the group watermark. */
 double bishfpm_group_rate(bishfpm_t *engine, const char *group_key,
                           uint64_t now_ms);
 
-/* query current item rate in group */
+/* Query decayed item count at now_ms, clamped to the group watermark. */
 double bishfpm_item_rate(bishfpm_t *engine, const char *group_key,
                          const char *item, uint64_t now_ms);
 
-/* query current pattern rate in group */
+/* Query the pattern upper estimate at now_ms, clamped to the group watermark.
+ * Use bishfpm_pattern_bounds to distinguish unknown absence from zero support.
+ */
 double bishfpm_pattern_rate(bishfpm_t *engine, const char *group_key,
                             const char *pattern, uint64_t now_ms);
 
@@ -199,7 +208,15 @@ double bishfpm_pattern_rate(bishfpm_t *engine, const char *group_key,
 size_t bishfpm_prune_pairs(bishfpm_t *, const char *group_key, uint64_t now_ms,
                            size_t max_pairs);
 
-/* prune inactive groups/items */
+/* Full maintenance: remove groups and marginal counts strictly below min_rate.
+ * Numeric marginal identities remain in surviving groups. SS/FSS patterns are
+ * removed when their upper counts are < min_rate; threshold pairs use
+ * upper <= min(min_rate, options.forget_below). Removing a group discards all
+ * its state regardless of pattern cutoffs. Successful maintenance advances
+ * surviving group clocks, clamping late timestamps to their watermarks.
+ * Returns groups removed, not items or patterns; zero can still mean those
+ * were pruned. Nonfinite/nonpositive min_rate and reentrant calls are no-ops.
+ */
 size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate);
 
 /* query engine statistics */

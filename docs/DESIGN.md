@@ -1,250 +1,374 @@
-# Architecture & Design Specification: `bishfpm`
-## Real-Time Burst Anomaly and Frequent Pattern Mining Engine
+# Design and operating contract
 
----
+Bishfpm tracks recurring combinations of categorical attributes within groups.
+Each group has its own decayed counts, candidate store, and notification state.
+The engine turns incoming events into count updates and synchronous alerts;
+the application chooses the groups, thresholds, and meaning of those alerts.
 
-## 1. Executive Summary & Problem Scope
+## Event processing
 
-`bishfpm` is a real-time, low-latency C library designed to identify coordinated burst anomalies across multi-attribute event streams. 
-
-In fraud detection, cybersecurity, and operational telemetry, coordinated attacks or anomalies share a subset of correlated attributes (e.g., an unexpected spike in purchases where `item_name="PlayStation 5"` co-occurs with `card_country="RU"` and `payment_type="prepaid"`). 
-
-Traditional Frequent Pattern Mining (FPM) algorithms (e.g., Apriori, FP-Growth, Eclat, LCM) are fundamentally ill-suited for this problem:
-1. **Static / Batch Orientation**: They operate over bounded, static transaction databases in batch passes rather than high-throughput streaming events.
-2. **Combinatorial Explosion**: A transaction with $M$ attributes contains $2^M - 1$ possible itemsets. For $M=20$, each event generates $1,048,575$ subsets, making real-time line-rate tracking intractable.
-3. **Static Support vs. Velocity Bursts**: Traditional support measures static frequency counts over a historical window, failing to isolate rapid temporal rate spikes relative to dynamic localized baselines.
-
-`bishfpm` solves this by introducing a **Gated Two-Phase Candidate Promotion Algorithm**:
-1. **Fast-path $O(M)$ Continuous Rate Tracking**: Tracks continuous exponentially decaying rates for individual items and group baselines with zero memory allocations on the hot path.
-2. **Gated Candidate Expansion**: Candidate combinations are evaluated *only if two or more items in the transaction are already individually elevated above baseline rate thresholds*.
-3. **Decayed HeavyKeeper Top-K Tracking**: Maintains high-rate candidate patterns in a contiguous, time-decayed sketch with exponential collision suppression.
-4. **Promotion Engine**: Promotes a candidate pattern to a triggered event when its rate accounts for a meaningful fraction $\alpha$ of the group's total rate.
-
----
-
-## 2. High-Level Architecture
-
-```
-Incoming Event: (group_key, timestamp, items[0..m-1])
-                       │
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│  Phase 1: Rate Engine (EWMA Continuous Time Decay)     │
-│  - Update Group Rate: R(group, t)                      │
-│  - For each item i: Update R(item_i | group, t)        │
-└──────────────────────┬─────────────────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│  Phase 2: Elevation Gating & Candidate Expansion       │
-│  - Filter elevated items: E = { i | R(i) >= tau_item } │
-│  - If |E| < min_order: Normal event, exit fast path    │
-│  - If |E| >= min_order: Generate k-subsets             │
-│  - Canonicalize & serialize itemsets (e.g. sorted \x1f)│
-└──────────────────────┬─────────────────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│  Phase 3: Decayed HeavyKeeper Top-K Tracker            │
-│  - Update candidate itemsets in Group's Top-K Sketch   │
-│  - Probabilistic collision decay: P(decay) = b^(-c)    │
-│  - Query current rate estimate R(candidate | group)    │
-└──────────────────────┬─────────────────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│  Phase 4: Promotion & Temporal Query Engine            │
-│  - Condition: R(candidate) >= alpha * R(group)         │
-│  - If matched: emit Triggered Pattern Event            │
-│  - Cooldown filter suppresses duplicate alert storms   │
-│  - Priority Search Tree (PST) temporal range indexing  │
-└────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["Incoming event"] --> B["Validate, sort, and deduplicate items"]
+    B --> C["Check work limits and reserve group/dictionary capacity"]
+    C --> D["Commit group and item counts at the group clock"]
+    D --> E["Select items passing count/share gates"]
+    E --> F["Generate and update a candidate"]
+    F --> G["Check promotion, lift, subset suppression, and cooldown"]
+    G --> H["Deliver callback if eligible"]
+    H --> I{"More candidates?"}
+    I -->|Yes| F
+    I -->|No| J["Return alert decision count"]
 ```
 
----
+Preparation checks the complete event before committing counts. It validates
+encoded lengths, bounds candidate work, and reserves all missing dictionary
+keys. Stores that require capacity reservation also check whether the complete
+event can fit. Failure at this stage rejects the whole event.
 
-## 3. Mathematical Foundations
+After reservation, the engine updates the group count and every distinct item's
+count. Items passing the marginal count/share gates participate in candidate
+generation. The general engine enumerates configured itemset orders from smallest
+to largest; numeric engines enumerate pairs directly.
 
-### 3.1 Continuous Time-Decayed EWMA Rates
+Each candidate update and its notification finish before the next candidate is
+updated. A callback querying the engine sees that intermediate state. Processing
+all candidates first and delivering callbacks afterward would change this contract.
 
-Events arrive at arbitrary timestamps $t$ represented as 64-bit timestamps in milliseconds. Instead of fixed or leaping sliding-window ring buffers (which suffer from quantization artifacts and memory overhead), rates are modeled as continuous exponentially decaying counters.
+## Counts and time
 
-Given an event at timestamp $t$ and prior event at $t_{\text{prev}}$:
-$$\Delta t = t - t_{\text{prev}}$$
-$$\text{decay}(\Delta t) = e^{-\lambda \Delta t}$$
-$$R_t = R_{t_{\text{prev}}} \cdot \text{decay}(\Delta t) + 1.0$$
-$$t_{\text{prev}} \leftarrow t$$
+All count thresholds and query results use exponentially decayed counts. With
+half-life `H` and `lambda = ln(2) / H`, event weights `w_i` at times `t_i`
+contribute to the count at time `T`:
 
-where:
-- Half-life $T_{1/2}$ is the duration over which an unrefreshed rate decays by 50%.
-- Decay constant $\lambda = \frac{\ln 2}{T_{1/2}}$.
-- When $\Delta t \ge 0$, decay is in range $(0, 1]$. Out-of-order events ($\Delta t < 0$) are counted additively without backwards time mutation.
-
-### 3.2 Steady-State Rate Convergence & Threshold Calibration
-
-For a stationary Poisson stream arriving at mean rate $r$ (events/sec) with half-life $T_{1/2}$, the expected inter-arrival time is $\Delta t = \frac{1}{r}$. 
-
-The steady-state rate $R_{\infty}$ satisfies:
-$$R_{\infty} = R_{\infty} \cdot e^{-\lambda / r} + 1 \implies R_{\infty} = \frac{1}{1 - e^{-\lambda / r}}$$
-
-Using the first-order Taylor approximation $1 - e^{-x} \approx x$ for small $\lambda / r$:
-$$R_{\infty} \approx \frac{r}{\lambda} = r \cdot \frac{T_{1/2}}{\ln 2} \approx 1.4427 \cdot r \cdot T_{1/2}$$
-
-**Operational Calibration Rule:**
-If an item's expected normal velocity is $r_{\text{baseline}}$ events/sec, an operator seeking to flag anomalies that exceed $k \times$ normal traffic sets:
-$$\tau_{\text{item}} = 1.4427 \cdot (k \cdot r_{\text{baseline}}) \cdot T_{1/2}$$
-
-### 3.3 Dynamic Baseline & Promotion Criterion
-
-- **Group Velocity**: $R(G, t)$ represents the total rate of group $G$ (e.g., store, merchant, account).
-- **Candidate Velocity**: $R(S \mid G, t)$ is the estimated rate of candidate pattern $S \subseteq I$ in group $G$.
-- **Promotion Threshold**:
-  A candidate itemset $S$ with $|S| \ge \text{min\_order}$ is promoted to a **Triggered Pattern** if:
-  $$R(S \mid G, t) \ge \alpha \cdot R(G, t) \quad \text{and} \quad R(S \mid G, t) \ge \tau_{\text{min\_pattern}}$$
-  where $\alpha \in (0, 1]$ represents the burst fraction (e.g., $\alpha = 0.25$ indicates that this pattern alone accounts for 25% or more of the entire group's recent traffic).
-
----
-
-## 4. Algorithmic Components & Complexity Analysis
-
-### 4.1 Gated Candidate Generation
-
-Let transaction $T$ arrive with $M$ attributes: $I = \{i_1, i_2, \dots, i_M\}$.
-1. For each item $i_j \in I$, query and update $R(i_j \mid G)$.
-2. Collect the set of elevated items:
-   $$E = \{ i \in I \mid R(i \mid G) \ge \tau_{\text{item}} \}$$
-3. **Complexity Comparison**:
-   - **Unbounded FPM**: Evaluates $2^M - 1$ subsets. For $M=20$, $1,048,575$ subsets per event.
-   - **`bishfpm` Gated Evaluation**:
-     - **Normal Traffic**: $|E| < \text{min\_order} \implies 0$ candidate combinations generated. Processing time is strictly $\mathcal{O}(M)$ hash table lookups.
-     - **Burst Traffic**: Only items with elevated rates enter $E$. Evaluating combinations up to size $k_{\text{max}}$ generates:
-       $$|\mathcal{C}| = \sum_{k=\text{min\_order}}^{k_{\text{max}}} \binom{|E|}{k}$$
-       Because $|E|$ is typically 2 or 3 during an anomaly, $|\mathcal{C}| \le \binom{3}{2} + \binom{3}{3} = 4$, entirely preventing combinatorial explosion while targeting the exact anomalous correlation.
-
-### 4.2 Canonical Itemset Serialization
-
-To maintain order-independent pattern identification:
-1. Elevated items are sorted lexicographically: `["card_country=RU", "item=PS5"]`.
-2. Delimited with the ASCII Unit Separator `\x1f` (value 31): `"card_country=RU\x1fitem=PS5"`.
-3. Guarantees deterministic hashing and avoids string allocations via reusable scratch arenas.
-
-### 4.3 HeavyKeeper with Exponential Collision Suppression
-
-`bishfpm` tracks top candidates in a contiguous 2D table of $d$ rows and $w$ columns of buckets:
-```c
-typedef struct {
-    uint32_t fingerprint;
-    float    rate;
-    uint64_t last_time_ms;
-} bishfpm_hk_bucket_t;
+```text
+decay(dt) = exp(-lambda * dt) = 2^(-dt / H)
+C(T)      = sum_i(w_i * decay(T - t_i))
 ```
 
-#### Probabilistic Decay Math
-When candidate $S$ with fingerprint $\text{fp}$ maps to bucket $B$ where $B\text{.fingerprint} \neq \text{fp}$:
-$$P(\text{decay}) = b^{-\lfloor B\text{.rate} \rfloor} \quad (b \approx 0.95)$$
+Times and half-life are in milliseconds. After one half-life, a contribution of
+10 becomes 5. Exponential decay permits an incremental update without retaining
+the events: advance the previous count by multiplying by `decay(dt)`, then add
+the new weight. Decay factors compose:
 
-- **Frequent / Burst Patterns**: If $B\text{.rate} = 20$, $P(\text{decay}) = 0.95^{20} \approx 0.358$. With 4 rows, the probability of simultaneous decrement across all rows is $(0.358)^4 \approx 0.016$. The true burst pattern receives additive $+1$ updates on each occurrence, rapidly overpowering sporadic decay.
-- **Background / Noise Items**: If $B\text{.rate} \le 1$, $P(\text{decay}) = 0.95^1 = 0.95$. Uncorrelated items are almost immediately decremented and evicted.
-
-#### Top-K Min-Heap with $O(1)$ Hash Map Index
-Instead of linear scans in the heap on updates:
-- An open-addressing slot map maintains `pattern_hash -> heap_index`.
-- Lookups are $\mathcal{O}(1)$. Heap sift-up and sift-down maintain slot map entries during swaps, achieving $\mathcal{O}(d + \log K)$ per update.
-
-### 4.4 Temporal Indexing via Priority Search Tree
-
-To support real-time upstream queries over recent burst events:
-- Triggered patterns and candidate histories can be indexed into a **Priority Search Tree** (PST).
-- The PST stores 2D points $(x, y) = (\text{timestamp}, \text{rate})$.
-- Upstream systems execute 3-sided range queries:
-  $$\text{Query}([t_{\text{start}}, t_{\text{end}}], y \ge \tau_{\text{rate}})$$
-  returning all burst events active within the time window exceeding rate $\tau$ in optimal $\mathcal{O}(\log n + k)$ time, where $k$ is the number of reported events.
-
----
-
-## 5. API Specification (`bishfpm.h`)
-
-```c
-/* configuration parameters */
-typedef struct {
-    double   ewma_half_life_ms;     /* half-life for continuous decay */
-    double   item_rate_threshold;   /* item rate to trigger elevation */
-    double   promotion_fraction;    /* alpha: fraction of group rate for promotion */
-    double   min_pattern_rate;      /* absolute minimum rate for promotion */
-    uint32_t min_itemset_order;     /* min size of candidate pattern to trigger (default 2) */
-    uint32_t max_itemset_order;     /* max size of candidate combinations (default 3) */
-    uint32_t topk_k;                /* number of heavy hitters to track per group */
-    uint32_t topk_width;            /* HeavyKeeper table width */
-    uint32_t topk_depth;            /* HeavyKeeper table depth */
-    uint64_t trigger_cooldown_ms;   /* cooldown before re-triggering same pattern */
-} bishfpm_config_t;
-
-/* triggered pattern result */
-typedef struct {
-    char     pattern[BISHFPM_MAX_PATTERN_LEN];   /* canonical serialized pattern string */
-    char     formatted[BISHFPM_MAX_PATTERN_LEN]; /* human readable comma-separated string */
-    double   pattern_rate;                       /* current pattern rate */
-    double   group_rate;                         /* current total group rate */
-    double   rate_fraction;                      /* pattern_rate / group_rate */
-    uint32_t item_count;                         /* number of items in pattern */
-    uint64_t timestamp;                          /* timestamp of triggering event */
-} bishfpm_trigger_t;
-
-typedef void (*bishfpm_trigger_cb)(const char *group_key,
-                                  const bishfpm_trigger_t *trigger,
-                                  void *udata);
-
-/* engine lifecycle */
-bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg);
-void       bishfpm_free(bishfpm_t *engine);
-
-/* event ingestion */
-int bishfpm_add_event(bishfpm_t *engine,
-                      const char *group_key,
-                      uint64_t timestamp_ms,
-                      const char *const *items,
-                      size_t num_items,
-                      bishfpm_trigger_cb cb,
-                      void *udata);
+```text
+decay(a + b) = decay(a) * decay(b)
 ```
 
----
+Advancing in several steps therefore gives the same count as advancing once,
+up to floating-point rounding. At a common time, aging multiplies counts and
+their error bounds by the same positive factor, preserving inequalities and
+count ratios until new input or pruning changes them.
 
-## 6. Repository Layout (Matching `../nanorq`)
+### Relating counts to arrival rates
 
+Counts measure weighted arrival history. The exponential kernel has total mass
+`1 / lambda` milliseconds, so `C(T) * 1000 * lambda` gives a normalized smoothed
+per-second rate estimate.
+
+For an unfiltered counter receiving stationary Poisson arrivals at `r` events
+per second, with unit weights, the steady-state moments at an arbitrary
+observation time are:
+
+```text
+E[C]   = r * H / (1000 * ln(2))
+Var[C] = r * H / (2000 * ln(2))
 ```
-bishfpm/
-├── .clang-format           /* LLVM, 4-space, Linux braces */
-├── .gitignore              /* ignore binaries, objects, profiles */
-├── .gitmodules             /* submodule registration */
-├── Makefile                /* all, lib, test, indent, clean */
-├── deps/
-├── docs/
-│   └── DESIGN.md           /* formal architecture & mathematical specification */
-├── include/
-│   ├── bishfpm.h           /* public interface */
-│   ├── bishfpm_arena.h     /* bump-pointer arena allocator */
-│   ├── bishfpm_hash.h      /* 64-bit MurmurHash3 */
-│   ├── bishfpm_itemset.h   /* subset generation & canonicalization */
-│   ├── bishfpm_rate.h      /* EWMA & rate math */
-│   └── bishfpm_topk.h      /* HeavyKeeper top-k sketch */
-├── lib/
-│   ├── bishfpm.c           /* core engine and group orchestration */
-│   ├── itemset.c           /* sorting and combinatorial subset expansion */
-│   ├── rate.c              /* rate updates and continuous decay */
-│   └── topk.c              /* contiguous HeavyKeeper + indexed min-heap */
-├── t/
-│   ├── 00util/             /* C test regression binaries */
-│   │   ├── test_engine.c
-│   │   ├── test_itemset.c
-│   │   ├── test_rate.c
-│   │   └── test_topk.c
-│   ├── Util.pm             /* Perl test harness utilities */
-│   ├── 10rate.t            /* rate decay unit tests */
-│   ├── 20topk.t            /* HeavyKeeper accuracy and eviction tests */
-│   ├── 30itemset.t         /* combinatorial subset & canonicalization tests */
-│   ├── 40engine.t          /* end-to-end multi-attribute burst tests */
-│   └── 50fraud_burst.t     /* simulation verification test */
-└── examples/
-    └── fraud_burst.c       /* retail store credit card attack demonstration */
+
+A longer half-life accumulates more mass and responds more slowly to changes.
+For example, 10 events/second with a 1,000 ms half-life gives an expected count
+of about 14.43. This calibrates thresholds; an individual observation fluctuates.
+
+Periodic arrivals have a different shape. With one unit event every `d`
+milliseconds, the steady-state count immediately after an arrival is
+`1 / (1 - exp(-lambda * d))`. Substituting the mean Poisson spacing into that
+formula does not give the Poisson expectation. These formulas describe the
+underlying counter; gates, retention uncertainty, and pruning affect pattern
+estimates.
+
+### Watermarks and late input
+
+Each group maintains a monotonic watermark. Accepted events and successful
+maintenance advance it; queries and no-op calls do not. Timestamp zero is valid.
+Late events are discounted to the watermark before updating counts or evaluating
+gates and alerts. Callback timestamps use this effective group time.
+
+Queries before the watermark clamp to it. Queries into the future decay the
+current state without changing the watermark. Historical state cannot be
+reconstructed by querying an old timestamp. Standalone rate counters and top-k
+stores maintain their own clocks.
+
+Engine event weights are integers through `UINT32_MAX`. Standalone floating
+weight APIs require finite, nonnegative weights and a finite, positive half-life.
+Double precision limits apply: unit increments may lose resolution above `2^53`,
+and sufficiently old contributions underflow to zero.
+
+## How the stages work together
+
+The engine separates which combinations to examine, how much recent support
+they have, and whether to notify the application. Each stage addresses a
+different part of the problem.
+
+### Limit discovery work before counting combinations
+
+A candidate is a combination of distinct items from the current event, within
+the configured itemset orders. An item is eligible when its updated marginal
+count meets `item_rate_threshold` and, when enabled, its share of the updated
+group count meets `item_share_threshold`. Every item in a candidate must qualify.
+These gates include the current event's contribution.
+
+An event with `M` distinct items has `2^M - 1` nonempty subsets. Limiting itemset
+order and selecting items through marginal gates reduces the combinations sent
+to the store. With `m` eligible items and pair-only tracking, this becomes
+`m * (m - 1) / 2` candidate updates.
+
+The mathematical motivation is that a combination cannot occur more often than
+any of its constituent items when counted over the same history. However, the
+online gate is a deliberate approximation: combinations receive no updates
+before all their items qualify. Passing a gate later cannot recover that earlier
+history. The work budget separately rejects an event whose worst-case expansion
+is too large, even if gates might have reduced its actual expansion.
+
+### Compare recent support within a group
+
+Group, item, and pattern counts use the same half-life and effective time. This
+makes ratios compare mass over the same aging rule. Let `G` be group count,
+`I_i` item counts, and `L` a conservative pattern count. The decision quantities
+are:
+
+```text
+absolute support         = L
+group share              = L / G
+independence expectation = G * product_i(I_i / G)
+lift                     = L / independence expectation
 ```
+
+Lift defaults to `1.0` for singletons or nonpositive count inputs. Positive
+counts use scaled arithmetic when needed to avoid intermediate underflow;
+lift above the representable double range is positive infinity. Group share is
+zero when the group count is zero.
+
+Absolute support requires enough observed mass. Group share asks whether the
+pattern accounts for a substantial part of this group's activity. Lift asks
+whether co-occurrence exceeds the expectation from the current item marginals.
+For example, `G=1000`, `I_a=200`, `I_b=100`, and `L=50` give 5% group share and
+lift 2.5: the pair is concentrated relative to independence while representing
+a modest share of the group. The application chooses which conditions matter.
+Lift uses the maintained marginals, including any effects of marginal pruning;
+it does not establish statistical significance or a change from past behavior.
+
+### Keep counting uncertainty separate from notification policy
+
+The store supplies count estimates; it determines which candidates remain
+available and how uncertain their counts are. Where conservative bounds are
+available, promotion uses the lower bound. This prevents upper-estimate error
+alone from creating support, share, or lift eligibility, but uncertainty and
+missing history can still cause missed promotions. Changing the store changes
+these accuracy and resource tradeoffs without changing the role of the other
+stages.
+
+Subset suppression and cooldowns then control overlapping and repeated alerts.
+They do not stop candidate counting. A pattern can remain frequent while
+producing no callback, and a high count-recovery rate need not imply the same
+notification recall. Counting quality and notification policy must therefore
+be evaluated separately.
+
+## Input and identity
+
+Events belong to a nonempty group key. Items are sorted and deduplicated, so
+repeated attributes count once per event; NULL and empty item entries are
+ignored. Input strings are borrowed for ingestion, and retained keys are copied.
+
+Valid zero-weight or empty-input calls return zero without changing group state
+or evaluating notifications. They count as `events_noop`; basic argument and
+input-width validation still applies.
+
+Patterns use sorted unique items joined by unit separators (`0x1f`), which cannot
+appear inside an item. Use this canonical encoding as identity; formatted output
+is for display and can be truncated or ambiguous. Hash collisions are resolved
+using complete identities. Representation limits are defined in
+[`bishfpm_limits.h`](../include/bishfpm_limits.h).
+
+### Numeric identities
+
+Numeric pair engines assign stable per-group IDs to item strings and pack two
+IDs into a pair key. Strings remain in the dictionary for input lookup and
+output; public pattern queries still use canonical two-item strings.
+
+Marginal pruning resets weak counts but keeps these identities, so the item
+limit bounds lifetime vocabulary until the group is removed. Pruning a pair
+neither recycles its IDs nor releases its cooldown. Group removal discards the
+dictionary, patterns, and cooldowns together.
+
+## Store interface and count uncertainty
+
+The engine sends each evaluated candidate's identity, discounted weight, and
+common group time to its store. The store returns residency and a count estimate
+with any available uncertainty bounds. Its retention policy determines which
+patterns remain available under the configured memory limit. See the
+[README](../README.md#choosing-a-store) for store selection and
+[prior art](PRIOR_ART.md#ancestry) for algorithm lineage.
+
+Bounds cover the evaluated candidate stream: only candidates whose items pass
+the marginal gates receive updates. Disabling both gates includes every
+combination of the configured orders in accepted events. Weighted and
+unit-by-unit replay can cross gates at different times.
+
+A known interval encloses the candidate's true decayed count for that history,
+subject to floating-point rounding. Estimates and their uncertainty age together.
+Where an upper estimate `U` and error `E` are available:
+
+```text
+lower = max(0, U - E)
+upper = U
+```
+
+The engine uses the conservative lower count for promotion and lift. Triggers
+expose these values as `pattern_rate`, `pattern_upper_bound`, and `pattern_error`.
+At support threshold `S`, a known lower bound at least `S` confirms support;
+a known upper bound below `S` rules it out. An interval crossing `S` is uncertain.
+Conservative counting can therefore coexist with missed promotions.
+
+`bishfpm_pattern_bounds` reports the interval, residency, and whether the interval
+is known. Absence from the resident set does not establish zero support: the
+store may supply an absent-key bound or report uncertainty as unknown.
+`bishfpm_pattern_rate` returns the upper estimate, or zero when the store cannot
+estimate an absent key. Use the bounds query to distinguish a certified zero
+from an unknown result. A missing group has zero history in its current lifetime.
+
+## Notification decisions
+
+Each generated candidate is submitted to the store for counting. Generation
+alone guarantees neither retention nor an alert. After the update, promotion
+requires both conditions, using the conservative pattern count `L` and updated
+group count `G`:
+
+```text
+L     >= min_pattern_rate
+L / G >= promotion_fraction
+```
+
+The group count includes every accepted event, including events with no eligible
+candidates; the no-op calls described under [input](#input-and-identity) contribute
+nothing. For example, with `G=100`, `min_pattern_rate=5`, and
+`promotion_fraction=0.20`, a candidate with `L=15` fails the share requirement;
+one with `L=25` passes both requirements.
+
+Promotion is evaluated on candidate updates. It is an eligibility decision each
+time, rather than a permanent status or a requirement to cross a threshold from
+below. Queries and the passage of time alone do not produce notifications.
+A promoted candidate still passes through optional suppression checks:
+
+1. **Lift:** require sufficient concentration relative to the item marginals.
+2. **Subset suppression:** when `subsumption_ratio > 0`, suppress a candidate if
+   a resident proper subset has a positive lower count `P` and
+   `L < subsumption_ratio * P`, provided that subset's prior notification decision
+   is still within `trigger_cooldown_ms`. A prior decision counts even when no
+   callback was supplied. Missing subsets supply no evidence; pair-only engines
+   have no smaller tracked patterns. This reduces overlap without producing
+   closed or maximal itemsets.
+3. **Cooldown:** suppress repeats until the configured duration has elapsed.
+
+Cooldown protection is independent of store residency. When notification storage
+is full, active protection is retained and new alerts are suppressed. Candidate
+counts continue to update. A separate index has twice as many slots as the
+identity capacity, so saturation leaves empty probe slots. Its payload is
+included in both current-memory statistics and the conservative memory bound.
+
+Setting `trigger_cooldown_ms` to zero disables both repeated-alert cooldowns and
+subset suppression: no prior notification decisions are retained for either
+check.
+
+Ingestion returns `-1` on rejection. Otherwise, it returns the number of eligible
+alert decisions, even if no callback was supplied. Counting a decision and
+delivering a callback are distinct operations.
+
+## Pruning and group lifetime
+
+Full pruning through `bishfpm_prune` retires weak groups and forgets weak marginal
+and pattern history in surviving groups. Forgetting marginal mass can change
+later gates and lift. Group retirement starts a new observation epoch and permits
+a fresh numeric dictionary. Surviving groups also reclaim expired notification
+identities when maintenance storage is available, while retaining active
+cooldown protection.
+
+Bounded pair pruning removes weak pairs from one group while retaining marginal
+histories and identities. The store's retention policy governs what may be
+forgotten and how uncertainty survives readmission. Removing entries frees
+resident slots but need not reduce allocated storage. A removal budget bounds
+entries removed, not wall-clock time.
+
+The threshold pair store can also prune automatically during ingestion to reserve
+capacity for the complete event. It only forgets pairs whose upper counts are at
+or below `forget_below`; if too few slots can be made available, the event is
+rejected before counts change.
+
+See the [public API](../include/bishfpm.h) for pruning options and store-specific
+cutoff behavior.
+
+## Resource limits and complexity
+
+The engine bounds groups, marginal identities, resident patterns, notification
+state, input width, candidate work, and library allocation payload. See the
+[README configuration guidance](../README.md#configuration) for constructor
+constraints, the [public API](../include/bishfpm.h) for configuration fields, and
+[`bishfpm_limits.h`](../include/bishfpm_limits.h) for representation limits.
+
+Admission sums `binomial(unique_items, order)` over configured orders before
+applying gates. This bounds the worst-case expansion for the whole event;
+exceeding the budget rejects the event rather than processing a partial set of
+candidates.
+
+The constructor checks a conservative payload bound against `max_memory_bytes`,
+including retained state, workspaces, and temporary allocations that may coexist.
+Reported current payload can be below this bound. Allocator overhead, stack,
+caller buffers, callback allocations, and other engines are outside the budget;
+it is not a bound on process memory.
+
+Preparation sorts items, typically `O(M log M)`. Candidate cost depends on store
+updates and notification checks. Collisions can lengthen lookups, and maintenance
+can scan or rebuild state. These limits do not guarantee latency; measure
+maintenance and callback time as part of the application workload.
+
+## Failure and diagnostics
+
+Rejected events leave counts, retained identities, cooldowns, and watermarks
+unchanged. Internal capacity and diagnostic counters may change. A failed new
+group is removed, so the caller can retry the complete event.
+
+All fallible reservation for count updates finishes before commit. Notification
+storage can still fail or saturate afterward; existing cooldown protection is
+preserved and alerts may be suppressed. This never turns an accepted event into
+a rejected one.
+
+Statistics distinguish event acceptance and rejection, candidate work,
+notification decisions and delivery, and memory use. A separate cumulative
+rejection snapshot identifies why ingestion failed. Suppressed notifications
+are not rejected events. Counter fields and query functions are defined in the
+[public API](../include/bishfpm.h).
+
+## Ownership and concurrency
+
+Callbacks run synchronously with borrowed group/trigger pointers. Copy results
+needed after the callback returns. Read-only queries are allowed during a
+callback. Nested ingestion returns `-1`; prune and free during ingestion are
+ignored. Free the engine after the outer ingestion call has returned.
+
+The application serializes all access to an engine, including reads. There are
+no background workers. Do not unwind through library frames using exceptions,
+`longjmp`, or asynchronous cancellation.
+
+State is in memory. Restart begins empty unless the application replays history.
+Retrying a rejected event is safe for counts; replaying an accepted event counts
+it again. Persistence, durable offsets, deduplication, and delivery policy belong
+to the application.
+
+## API reference
+
+The engine API is declared in [`bishfpm.h`](../include/bishfpm.h). Independent
+counters, stores, itemset helpers, and arenas are available through
+[`bishfpm_lowlevel.h`](../include/bishfpm_lowlevel.h) and its component headers,
+which document their ownership and use.
+
+For algorithm ancestry, see [prior art](PRIOR_ART.md). For store selection and
+build commands, see the [README](../README.md).

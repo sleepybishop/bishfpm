@@ -28,6 +28,7 @@ struct bishfpm_rate_table {
   bishfpm_rate_entry_t *entries;
   size_t capacity;
   size_t count;
+  size_t key_bytes; /* Owned key payload, including terminating NUL bytes. */
   size_t max_items;
   uint64_t hash_seed;
 };

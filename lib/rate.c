@@ -1,6 +1,7 @@
 #include "bishfpm_hash.h"
 #include "bishfpm_rate.h"
 #include "internal.h"
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,8 +33,20 @@ double bishfpm_rate_decay(double current_rate, uint64_t delta_ms,
   if (delta_ms == 0 || half_life_ms <= 0.0) {
     return current_rate;
   }
-  double factor = exp(-LN2 * ((double)delta_ms / half_life_ms));
-  return current_rate * factor;
+  double half_lives = (double)delta_ms / half_life_ms;
+  if (half_lives < -DBL_MIN_EXP || !isfinite(current_rate) || isnan(half_lives))
+    return current_rate * exp(-LN2 * half_lives);
+
+  /* A tiny multiplier can underflow before a large count is applied. Shift
+   * the combined exponent instead, rounding only the final count to zero. */
+  int exponent;
+  double fraction = frexp(current_rate, &exponent);
+  if (half_lives >= exponent - DBL_MIN_EXP + DBL_MANT_DIG + 1)
+    return 0;
+  /* The underflow bound above also excludes huge/infinite values before this
+   * conversion. The fractional multiplier stays between one half and one. */
+  int whole = (int)half_lives;
+  return ldexp(fraction * exp2(-(half_lives - whole)), exponent - whole);
 }
 
 /* update rate with new weighted event */
@@ -213,6 +226,17 @@ size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
 
   /* calculate compacted capacity */
   size_t new_cap = next_pow2(survivors * 2 < 16 ? 16 : survivors * 2);
+  if (!removed && new_cap == tbl->capacity) {
+    for (size_t i = 0; i < tbl->capacity; i++) {
+      bishfpm_rate_entry_t *entry = &tbl->entries[i];
+      if (entry->key && now_ms >= entry->rate.last_time_ms) {
+        entry->rate.rate =
+            bishfpm_rate_query(&entry->rate, now_ms, half_life_ms);
+        entry->rate.last_time_ms = now_ms;
+      }
+    }
+    return 0;
+  }
   bishfpm_rate_entry_t *new_entries =
       calloc(new_cap, sizeof(bishfpm_rate_entry_t));
   if (!new_entries) {
@@ -229,6 +253,7 @@ size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
     double current =
         bishfpm_rate_query(&tbl->entries[i].rate, now_ms, half_life_ms);
     if (current < min_rate) {
+      tbl->key_bytes -= strlen(tbl->entries[i].key) + 1;
       free(tbl->entries[i].key);
       tbl->entries[i].key = NULL;
     } else {
@@ -288,7 +313,7 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
   bishfpm_rate_entry_t *staged = calloc(missing, sizeof(*staged));
   if (!staged)
     return RATE_ALLOCATION;
-  size_t n = 0;
+  size_t n = 0, key_bytes = 0;
   for (size_t i = 0; i < count; i++) {
     uint64_t hash = bishfpm_hash_str(keys[i], tbl->hash_seed);
     if (rate_table_find(tbl, keys[i], hash))
@@ -296,6 +321,7 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
     char *copy = strdup(keys[i]);
     if (!copy)
       goto fail;
+    key_bytes += strlen(copy) + 1;
     staged[n].id = (uint32_t)(tbl->count + n);
     staged[n].key = copy;
     staged[n++].hash = hash;
@@ -320,6 +346,7 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
   tbl->entries = entries;
   tbl->capacity = capacity;
   tbl->count = total;
+  tbl->key_bytes += key_bytes;
   free(staged);
   return RATE_PREPARED;
 fail:
@@ -331,5 +358,15 @@ fail:
 
 bool bishfpm_rate_table_prepare(bishfpm_rate_table_t *tbl,
                                 const char *const *keys, size_t count) {
+  if (!tbl || (!keys && count))
+    return false;
+  /* Keep public input validation out of the engine's deduplicated hot path. */
+  for (size_t i = 0; i < count; i++) {
+    if (!keys[i])
+      return false;
+    for (size_t j = 0; j < i; j++)
+      if (!strcmp(keys[i], keys[j]))
+        return false;
+  }
   return rate_table_prepare_result(tbl, keys, count) == RATE_PREPARED;
 }

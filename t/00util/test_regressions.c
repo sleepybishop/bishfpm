@@ -19,6 +19,84 @@ static void test_cb(const char *grp, const bishfpm_trigger_t *trig,
   snprintf(g_last_pattern, sizeof(g_last_pattern), "%s", trig->pattern);
 }
 
+typedef struct {
+  int calls;
+  double lift;
+} lift_result_t;
+
+static void lift_cb(const char *group, const bishfpm_trigger_t *trigger,
+                    void *udata) {
+  (void)group;
+  lift_result_t *result = udata;
+  result->calls++;
+  result->lift = trigger->lift;
+}
+
+/* A positive independence expectation can be too small to store as a double,
+ * even when all counts and the resulting lift are normal finite doubles. */
+static void test_lift_range(void) {
+  for (int backend = -1; backend <= BISHFPM_PAIR_FSS; backend++) {
+    for (int extreme = 0; extreme < 2; extreme++) {
+      for (int reject = 0; reject < 2; reject++) {
+        bishfpm_config_t c;
+        bishfpm_config_default(&c);
+        c.ewma_half_life_ms = 1000;
+        c.min_itemset_order = c.max_itemset_order = 2;
+        c.item_rate_threshold = c.item_share_threshold = 0;
+        c.min_pattern_rate = c.promotion_fraction = 0;
+        c.trigger_cooldown_ms = 0;
+        c.min_lift = reject ? (extreme ? ldexp(1.0, 668) : nextafter(2, 3)) : 2;
+        bishfpm_pair_options_t options = {
+            .store = (bishfpm_pair_store_t)backend,
+            .capacity = 8,
+            .sketch_width = backend == BISHFPM_PAIR_FSS ? 8 : 0,
+            .forget_below = 0};
+        bishfpm_t *engine = backend < 0 ? bishfpm_create(&c)
+                                        : bishfpm_create_pairs(&c, &options);
+        assert(engine);
+        const char *background[] = {"background"}, *pair[] = {"a", "b"};
+        uint64_t now = extreme ? 667000 : 0;
+        assert(bishfpm_add_event(engine, "g", now, background, 1, NULL, NULL) ==
+               0);
+        lift_result_t result = {0};
+        assert(bishfpm_add_event(engine, "g", 0, pair, 2, lift_cb, &result) ==
+               !reject);
+        assert(result.calls == !reject);
+        if (!reject) {
+          double expected = extreme ? ldexp(1.0, 667) : 2;
+          assert(isfinite(result.lift));
+          assert(fabs(result.lift / expected - 1) < 1e-12);
+        }
+        bishfpm_free(engine);
+      }
+    }
+  }
+
+  /* High-order lift can overflow even with ordinary integer event weights.
+   * It must still pass a finite lift threshold and report positive infinity. */
+  bishfpm_config_t c;
+  bishfpm_config_default(&c);
+  c.min_itemset_order = c.max_itemset_order = 32;
+  c.item_rate_threshold = c.min_pattern_rate = c.promotion_fraction = 0;
+  c.min_lift = 2;
+  bishfpm_t *engine = bishfpm_create(&c);
+  assert(engine);
+  const char *background[] = {"background"};
+  for (int i = 0; i < 100; i++)
+    assert(bishfpm_add_event_weighted(engine, "g", 0, background, 1, UINT32_MAX,
+                                      NULL, NULL) == 0);
+  char names[32][8];
+  const char *items[32];
+  for (int i = 0; i < 32; i++) {
+    snprintf(names[i], sizeof(names[i]), "i%02d", i);
+    items[i] = names[i];
+  }
+  lift_result_t result = {0};
+  assert(bishfpm_add_event(engine, "g", 0, items, 32, lift_cb, &result) == 1);
+  assert(result.calls == 1 && isinf(result.lift) && result.lift > 0);
+  bishfpm_free(engine);
+}
+
 /* reentrancy callback helper */
 static void reentrant_cb(const char *grp, const bishfpm_trigger_t *trig,
                          void *udata) {
@@ -267,6 +345,55 @@ static void test_f10_candidate_order_bounds(void) {
   double pr = bishfpm_pattern_rate(e, "grp", "a", 1000);
   assert(pr == 0.0);
 
+  bishfpm_free(e);
+}
+
+/* Events below the minimum order still contribute group and item history. */
+static void test_no_candidate_length_limit(void) {
+  bishfpm_config_t c;
+  bishfpm_config_default(&c);
+  c.min_itemset_order = c.max_itemset_order = 4;
+  c.item_rate_threshold = c.min_pattern_rate = c.promotion_fraction = 0;
+  bishfpm_t *e = bishfpm_create(&c);
+  assert(e);
+
+  char names[4][201];
+  const char *items[4];
+  for (size_t i = 0; i < 4; i++) {
+    memset(names[i], 'a' + (int)i, sizeof(names[i]) - 1);
+    names[i][sizeof(names[i]) - 1] = '\0';
+    items[i] = names[i];
+  }
+  /* Each item fits, but the untracked three-item encoding would not. */
+  assert(bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL) == 0);
+  const char *duplicates[] = {items[2], items[0], items[1], items[1]};
+  assert(bishfpm_add_event(e, "g", 1000, duplicates, 4, NULL, NULL) == 0);
+  assert(bishfpm_group_rate(e, "g", 0) == 2);
+  for (size_t i = 0; i < 3; i++)
+    assert(bishfpm_item_rate(e, "g", items[i], 0) == 2);
+
+  /* A configured candidate that exceeds the encoding limit still rejects. */
+  assert(bishfpm_add_event(e, "g", 10000, items, 4, NULL, NULL) == -1);
+  const char *delimiter[] = {"bad\037item"};
+  assert(bishfpm_add_event(e, "g", 10000, delimiter, 1, NULL, NULL) == -1);
+  char oversized[BISHFPM_MAX_ITEM_LEN + 1];
+  memset(oversized, 'x', sizeof(oversized) - 1);
+  oversized[sizeof(oversized) - 1] = '\0';
+  const char *invalid[] = {oversized};
+  assert(bishfpm_add_event(e, "g", 10000, invalid, 1, NULL, NULL) == -1);
+  assert(bishfpm_group_rate(e, "g", 0) == 2);
+  for (size_t i = 0; i < 3; i++)
+    assert(bishfpm_item_rate(e, "g", items[i], 0) == 2);
+  assert(bishfpm_item_rate(e, "g", items[3], 0) == 0);
+
+  bishfpm_stats_t stats;
+  bishfpm_rejection_stats_t reasons;
+  bishfpm_get_stats(e, &stats);
+  bishfpm_get_rejection_stats(e, &reasons);
+  assert(stats.events_accepted == 2 && stats.events_rejected == 3);
+  assert(stats.events_noop == 0 && stats.candidates_evaluated == 0 &&
+         stats.triggers_emitted == 0);
+  assert(reasons.pattern_length_limit == 1 && reasons.invalid_input == 2);
   bishfpm_free(e);
 }
 
@@ -614,7 +741,174 @@ static void test_f14_constructor_safety(void) {
   assert(topk == NULL);
 }
 
+static void test_numeric_query_validation(void) {
+  const char *malformed[] = {"a", "b\037a", "a\037b\037c", "\037b", "a\037"};
+  const char *ab[] = {"a", "b"};
+  for (int kind = BISHFPM_PAIR_SS; kind <= BISHFPM_PAIR_FSS; kind++) {
+    bishfpm_config_t c;
+    bishfpm_config_default(&c);
+    c.min_itemset_order = c.max_itemset_order = 2;
+    c.item_rate_threshold = c.item_share_threshold = 0;
+    bishfpm_pair_options_t options = {kind, 4,
+                                      kind == BISHFPM_PAIR_FSS ? 1U : 0U, 0};
+    bishfpm_t *e = bishfpm_create_pairs(&c, &options);
+    assert(e);
+    for (unsigned phase = 0; phase < 3; phase++) {
+      bishfpm_count_bounds_t bounds;
+      for (size_t i = 0; i < sizeof(malformed) / sizeof(*malformed); i++)
+        assert(!bishfpm_pattern_bounds(e, "g", malformed[i], 0, &bounds));
+      assert(bishfpm_pattern_bounds(e, "g", "a\037b", 0, &bounds));
+      if (phase == 0)
+        assert(bishfpm_add_event(e, "g", 0, ab, 2, NULL, NULL) >= 0);
+      else if (phase == 1)
+        assert(bishfpm_prune(e, 0, 2) == 1);
+    }
+    bishfpm_free(e);
+  }
+}
+
+typedef struct {
+  bishfpm_t *engine;
+  unsigned calls;
+} lift_oracle_t;
+
+static void check_callback_lift(const char *group, const bishfpm_trigger_t *t,
+                                void *udata) {
+  lift_oracle_t *oracle = udata;
+  oracle->calls++;
+  double expected = bishfpm_group_rate(oracle->engine, group, t->timestamp);
+  assert(expected == t->group_rate);
+  char pattern[BISHFPM_MAX_PATTERN_LEN];
+  strcpy(pattern, t->pattern);
+  char *item = pattern;
+  for (;;) {
+    char *split = strchr(item, BISHFPM_ITEM_DELIM);
+    if (split)
+      *split = 0;
+    double marginal =
+        bishfpm_item_rate(oracle->engine, group, item, t->timestamp);
+    assert(marginal > 0);
+    expected *= marginal / t->group_rate;
+    if (!split)
+      break;
+    item = split + 1;
+  }
+  expected = t->pattern_rate / expected;
+  assert(fabs(t->lift - expected) < 1e-12 * fmax(1, expected));
+}
+
+static void test_filtered_lift_and_callback_stats(void) {
+  unsigned delivered = 0, suppressed = 0;
+  for (int backend = -1; backend <= BISHFPM_PAIR_FSS; backend++) {
+    for (unsigned filter = 0; filter < 3; filter++) {
+      for (unsigned seeded = 0; seeded < 2; seeded++) {
+        bishfpm_config_t c;
+        bishfpm_config_default(&c);
+        c.min_itemset_order = 2;
+        c.max_itemset_order = backend < 0 ? 3 : 2;
+        c.item_rate_threshold = backend == BISHFPM_PAIR_THRESHOLD ? 0 : 3;
+        c.item_share_threshold = 0;
+        c.min_pattern_rate = 3;
+        c.promotion_fraction = 0;
+        c.ewma_half_life_ms = 1000000;
+        c.trigger_cooldown_ms = 100;
+        c.subsumption_ratio = .85;
+        c.topk_k = 64;
+        c.min_lift = filter == 0 ? 0 : filter == 1 ? 1.1 : 1e100;
+        c.hash_seed = seeded ? UINT64_C(0xfedcba9876543210) : 0;
+        bishfpm_pair_options_t options = {
+            (bishfpm_pair_store_t)backend, 64,
+            backend == BISHFPM_PAIR_FSS ? 17U : 0U, 0};
+        bishfpm_t *with_cb = backend < 0 ? bishfpm_create(&c)
+                                         : bishfpm_create_pairs(&c, &options);
+        bishfpm_t *without_cb = backend < 0
+                                    ? bishfpm_create(&c)
+                                    : bishfpm_create_pairs(&c, &options);
+        assert(with_cb && without_cb);
+        lift_oracle_t oracle = {with_cb, 0};
+        const char *selected[] = {"a", "b", "c"};
+        const char *background[] = {"background"};
+        const char *a[] = {"a"}, *b[] = {"b"};
+        for (unsigned control = 0; control < 2; control++) {
+          bishfpm_t *e = control ? without_cb : with_cb;
+          assert(bishfpm_add_event_weighted(e, "g", 0, selected, 3, 10, NULL,
+                                            NULL) >= 0);
+          assert(bishfpm_add_event_weighted(e, "g", 0, background, 1, 100, NULL,
+                                            NULL) == 0);
+          assert(bishfpm_add_event_weighted(e, "g", 0, a, 1, 20, NULL, NULL) ==
+                 0);
+          assert(bishfpm_add_event_weighted(e, "g", 0, b, 1, 30, NULL, NULL) ==
+                 0);
+        }
+        /* Cold items precede, separate, and follow the elevated items. */
+        const char *all[] = {"0", "a", "aa", "b", "bb", "c", "cc"};
+        const uint64_t times[] = {1000, 1000, 900, 1100, 1200};
+        for (size_t i = 0; i < sizeof(times) / sizeof(*times); i++) {
+          int notified = bishfpm_add_event(with_cb, "g", times[i], all, 7,
+                                           check_callback_lift, &oracle);
+          int silent =
+              bishfpm_add_event(without_cb, "g", times[i], all, 7, NULL, NULL);
+          assert(notified >= 0 && notified == silent);
+          bishfpm_stats_t x, y;
+          bishfpm_get_stats(with_cb, &x);
+          bishfpm_get_stats(without_cb, &y);
+          assert(x.triggers_emitted == y.triggers_emitted);
+          assert(x.triggers_suppressed == y.triggers_suppressed);
+          assert(x.cooldown_saturation == y.cooldown_saturation);
+          assert(x.candidates_evaluated == y.candidates_evaluated);
+          assert(x.callbacks_delivered == oracle.calls &&
+                 y.callbacks_delivered == 0);
+          delivered += notified;
+          suppressed += x.triggers_suppressed > 0;
+        }
+        if (filter == 2)
+          assert(oracle.calls == 0);
+        else
+          assert(oracle.calls > 0);
+        bishfpm_free(with_cb);
+        bishfpm_free(without_cb);
+      }
+    }
+  }
+  assert(delivered && suppressed);
+}
+
+static void test_preparation_length_paths(void) {
+  const size_t lengths[][4] = {{10, 11, 12, 13}, {80, 81, 200, 201}};
+  for (size_t row = 0; row < 2; row++) {
+    char names[4][BISHFPM_MAX_ITEM_LEN];
+    const char *items[4];
+    for (size_t i = 0; i < 4; i++) {
+      memset(names[i], 'a' + (int)i, lengths[row][i]);
+      names[i][lengths[row][i]] = 0;
+      items[i] = names[i];
+    }
+    for (unsigned order = 2; order <= 4; order++) {
+      bishfpm_config_t c;
+      bishfpm_config_default(&c);
+      c.item_rate_threshold = c.min_pattern_rate = c.promotion_fraction = 0;
+      c.min_itemset_order = 2;
+      c.max_itemset_order = order;
+      c.trigger_cooldown_ms = 0;
+      bishfpm_t *e = bishfpm_create(&c);
+      assert(e);
+      int expected = order == 2 ? 6 : order == 3 ? 10 : row ? -1 : 11;
+      assert(bishfpm_add_event(e, "g", 1000, items, 4, NULL, NULL) == expected);
+      assert(bishfpm_group_rate(e, "g", 1000) == (expected >= 0));
+      if (expected >= 0) {
+        for (size_t i = 0; i < 4; i++)
+          assert(bishfpm_item_rate(e, "g", items[i], 1000) == 1);
+      }
+      bishfpm_free(e);
+    }
+  }
+}
+
 int main(void) {
+  test_preparation_length_paths();
+  test_filtered_lift_and_callback_stats();
+  test_numeric_query_validation();
+  test_lift_range();
   test_f01_prune_lookup_chains();
   test_f02_duplicate_items();
   test_f03_delimiter_rejection();
@@ -624,6 +918,7 @@ int main(void) {
   test_f08_time_zero_and_late_arrival();
   test_f09_reentrancy_guard();
   test_f10_candidate_order_bounds();
+  test_no_candidate_length_limit();
   test_f11_partial_topk();
   test_f12_subsumption_invariance();
   test_f14_config_validation();

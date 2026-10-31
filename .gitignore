@@ -16,7 +16,4 @@ t/00util/*
 
 libbishfpm.so.*
 bishfpm.pc
-SCAN.md
 __pycache__/
-/data/kosarak/
-/data/lanl/

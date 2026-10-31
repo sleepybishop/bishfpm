@@ -24,7 +24,8 @@ static bishfpm_group_t group(size_t capacity) {
   static compact_t numeric_store;
   g.pairs = numeric_mode ? &numeric_store : NULL;
   g.cooldown_cap = capacity;
-  g.cooldowns = calloc(capacity, cooldown_entry_size(numeric_mode != 0));
+  g.cooldowns = calloc(capacity, cooldown_entry_size(numeric_mode != 0) +
+                                     2 * sizeof(uint32_t));
   assert(g.cooldowns);
   return g;
 }
@@ -108,6 +109,46 @@ static void allocation_failure(void) {
   assert(g.cooldown_cap == 32 && g.cooldown_count == 14);
   release(&g);
 }
+static void fallback_hint_and_probe_chains(void) {
+  bishfpm_group_t g = group(COOLDOWN_GROWTH_LIMIT);
+  bool saturated;
+  uint64_t hash = 2 * g.cooldown_cap - 2;
+  for (unsigned i = 0; i < COOLDOWN_GROWTH_LIMIT; i++)
+    assert(!update_hashed(&g, i, hash, i ? 1050 : 1000, &saturated));
+  fail_rebuild = 1;
+  assert(!update_hashed(&g, 5000, hash, 1100, &saturated));
+  assert(g.cooldown_oldest_ms == 1050);
+  size_t allocations = rebuild_allocations;
+  assert(update_hashed(&g, 5001, hash, 1100, &saturated) && saturated);
+  assert(rebuild_allocations == allocations);
+  for (unsigned i = 1; i < COOLDOWN_GROWTH_LIMIT; i++)
+    assert(update_hashed(&g, i, hash, 1100, &saturated) && !saturated);
+  assert(update_hashed(&g, 5000, hash, 1100, &saturated) && !saturated);
+  fail_rebuild = 0;
+  release(&g);
+}
+
+static void prune_cooldowns(void) {
+  bishfpm_config_t cfg;
+  bishfpm_config_default(&cfg);
+  cfg.item_rate_threshold = cfg.promotion_fraction = cfg.min_pattern_rate = 0;
+  cfg.trigger_cooldown_ms = 100;
+  cfg.ewma_half_life_ms = 1000;
+  bishfpm_t *e = bishfpm_create(&cfg);
+  assert(e);
+  const char *ab[] = {"a", "b"};
+  assert(bishfpm_add_event(e, "g", 1000, ab, 2, NULL, NULL) == 1);
+  bishfpm_group_t *g = find_group(e, "g", NULL);
+  assert(g && g->cooldown_count == 1);
+  assert(bishfpm_prune(e, 1050, .01) == 0);
+  assert(g->cooldown_count == 1);
+  assert(bishfpm_add_event(e, "g", 1050, ab, 2, NULL, NULL) == 0);
+  assert(bishfpm_prune(e, 1100, .01) == 0);
+  assert(g->cooldown_count == 0);
+  assert(bishfpm_add_event(e, "g", 1100, ab, 2, NULL, NULL) == 1);
+  bishfpm_free(e);
+}
+
 static void identity_collisions(void) {
   bishfpm_group_t g = group(16);
   bool saturated;
@@ -149,19 +190,78 @@ static void memory_accounting(void) {
     bishfpm_get_stats(e, &after);
     size_t slots_after = g->cooldown_cap + g->cooldown_spare_cap;
     assert(after.memory_current_bytes - before.memory_current_bytes ==
-           (slots_after - slots_before) * sizeof(pair_cooldown_t));
+           (slots_after - slots_before) *
+               (sizeof(pair_cooldown_t) + 2 * sizeof(uint32_t)));
     assert(after.memory_current_bytes <= after.memory_bound_bytes &&
            after.memory_bound_bytes <= cfg.max_memory_bytes);
     bishfpm_free(e);
   }
 }
+static void subsumption_probe_equivalence(void) {
+  const char *patterns[] = {"a\037b", "a\037c", "b\037c", "d\037e", "a\037bb"};
+  const char *candidates[][3] = {
+      {"a", "b", "c"}, {"a", "bb", "c"}, {"a", "d", "e"}, {"x", "y", "z"}};
+  for (unsigned seeded = 0; seeded < 2; seeded++) {
+    uint64_t seed = seeded ? UINT64_C(0xfedcba9876543210) : 0;
+    bishfpm_group_t g = group(16);
+    g.topk = bishfpm_topk_new(16, 1000);
+    assert(g.topk);
+    bishfpm_topk_set_seed(g.topk, seed);
+    bool saturated = false;
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(*patterns); i++) {
+      assert(bishfpm_topk_add(g.topk, patterns[i], 10 + i, 1000) > 0);
+      assert(!check_and_update_cooldown(&g, bishfpm_hash_str(patterns[i], seed),
+                                        patterns[i], 2, 1000 + i * 10, 100,
+                                        &saturated));
+    }
+    for (unsigned pruned = 0; pruned < 2; pruned++) {
+      if (pruned)
+        assert(bishfpm_topk_prune(g.topk, 1000, 12) == 2);
+      for (uint64_t now = 990; now <= 1140; now += 10) {
+        for (size_t candidate = 0; candidate < 4; candidate++) {
+          for (unsigned rate = 0; rate < 20; rate++) {
+            bool scan = is_candidate_subsumed(&g, candidates[candidate], 3,
+                                              rate, now, 100, .85, 1, seed);
+            bool probes = is_candidate_subsumed(&g, candidates[candidate], 3,
+                                                rate, now, 100, .85, 2, seed);
+            assert(scan == probes);
+          }
+        }
+      }
+    }
+    bishfpm_topk_free(g.topk);
+    release(&g);
+  }
+}
+
+static void full_stale_expiry_hint(void) {
+  bishfpm_group_t g = group(COOLDOWN_GROWTH_LIMIT);
+  bool saturated;
+  for (unsigned i = 0; i < COOLDOWN_GROWTH_LIMIT; i++)
+    assert(!update(&g, i, 1000, &saturated));
+  for (unsigned i = 0; i < COOLDOWN_GROWTH_LIMIT; i++)
+    assert(!update(&g, i, 1100, &saturated));
+  assert(g.cooldown_oldest_ms == 1000);
+  size_t allocations = rebuild_allocations;
+  assert(update(&g, 5000, 1100, &saturated) && saturated);
+  assert(g.cooldown_oldest_ms == 1100);
+  assert(g.cooldown_count == COOLDOWN_GROWTH_LIMIT);
+  assert(rebuild_allocations == allocations);
+  assert(update(&g, 0, 1100, &saturated) && !saturated);
+  release(&g);
+}
+
 int main(void) {
+  subsumption_probe_equivalence();
   memory_accounting();
+  prune_cooldowns();
   for (numeric_mode = 0; numeric_mode <= 1; numeric_mode++) {
     reuse_and_saturation();
     stale_expiry_hint();
+    full_stale_expiry_hint();
     allocation_failure();
     identity_collisions();
+    fallback_hint_and_probe_chains();
   }
   puts("test_cooldown passed.");
 }

@@ -154,7 +154,40 @@ static void public_api(void) {
   o.store = BISHFPM_PAIR_SS;
   assert(!bishfpm_create_pairs(&c, &o));
 }
+static void admission_rounding(void) {
+  compact_t *t = compact_new(1, 1000, 1, BISHFPM_PAIR_FSS, 0);
+  assert(t);
+  assert(compact_add(t, 1, 1, 1e17, 0).present);
+  assert(compact_prune(t, 0, 2e17) == 1);
+  topk_result_t add = compact_add(t, 2, 2, 1, 0);
+  topk_result_t query = compact_query(t, 2, 2, 0);
+  assert(add.present && query.present);
+  assert(add.lower == 0 && add.lower == query.lower);
+  assert(add.upper == query.upper && add.error == add.upper - add.lower);
+  compact_free(t);
+}
+
+static void rejected_updates_preserve_clock(void) {
+  for (int kind = BISHFPM_PAIR_SS; kind <= BISHFPM_PAIR_THRESHOLD; kind++) {
+    compact_t *t = compact_new(1, 1000, 0, kind, 9);
+    assert(t);
+    assert(compact_add(t, 1, 1, 8, 0).present);
+    assert(compact_prune(t, 0, 9) == 1);
+    assert(compact_add(t, 1, 1, DBL_MAX, 0).present);
+    assert(t->omitted_bound == 8);
+    assert(!compact_add(t, 1, 1, DBL_MAX, 1).present);
+    assert(t->max_time_ms == 0 && t->omitted_bound == 8);
+    assert(compact_query(t, 1, 1, 0).upper == DBL_MAX);
+    /* SS overflows on replacement; threshold refuses a full store. */
+    assert(!compact_add(t, 2, 2, DBL_MAX, 1).present);
+    assert(t->max_time_ms == 0 && t->omitted_bound == 8);
+    compact_free(t);
+  }
+}
+
 int main(void) {
+  admission_rounding();
+  rejected_updates_preserve_clock();
   transitions();
   oracle(1, false);
   oracle(17, false);

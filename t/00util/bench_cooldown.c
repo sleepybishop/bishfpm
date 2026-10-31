@@ -10,7 +10,8 @@ static double ns(void) {
 int main(void) {
   bishfpm_group_t g = {0};
   g.cooldown_cap = COOLDOWN_GROWTH_LIMIT;
-  g.cooldowns = calloc(g.cooldown_cap, cooldown_entry_size(false));
+  g.cooldowns =
+      calloc(g.cooldown_cap, cooldown_entry_size(false) + 2 * sizeof(uint32_t));
   assert(g.cooldowns);
   unsigned triggers = 0, suppressed = 0;
   double start = ns();

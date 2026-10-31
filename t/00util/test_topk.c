@@ -1,9 +1,34 @@
 #include "bishfpm_topk.h"
 #include <assert.h>
+#include <float.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
+static void test_large_mass_decay(void) {
+  bishfpm_topk_t *topk = bishfpm_topk_new(2, 1);
+  assert(topk);
+  assert(bishfpm_topk_add_weight(topk, "old-heavy", DBL_MAX / 2, 0) > 0);
+  assert(bishfpm_topk_add_weight(topk, "new-light", 1e-100, 1000) > 0);
+
+  double heavy = bishfpm_topk_query(topk, "old-heavy", 1075);
+  double light = bishfpm_topk_query(topk, "new-light", 1075);
+  assert(fabs(heavy / ldexp(DBL_MAX / 2, -1075) - 1) < 1e-12);
+  assert(fabs(light / ldexp(1e-100, -75) - 1) < 1e-12);
+  assert(heavy > light && light > 0);
+  assert(bishfpm_topk_query_lower(topk, "old-heavy", 1075) == heavy);
+  assert(bishfpm_topk_min_rate(topk, 1075) == light);
+
+  bishfpm_topk_item_t items[2];
+  assert(bishfpm_topk_get_top(topk, 1075, items, 2) == 2);
+  assert(!strcmp(items[0].pattern, "old-heavy") && items[0].rate == heavy);
+  assert(!strcmp(items[1].pattern, "new-light") && items[1].rate == light);
+  bishfpm_topk_free(topk);
+}
+
 int main(void) {
+  test_large_mass_decay();
+
   /* test top-k with capacity 4 */
   bishfpm_topk_t *topk = bishfpm_topk_new(4, 5000.0);
   assert(topk != NULL);
