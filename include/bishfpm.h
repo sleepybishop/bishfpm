@@ -33,8 +33,8 @@ extern "C" {
  * Count thresholds and min_lift must be nonnegative; shares and
  * subsumption_ratio must be in [0, 1]. When min_pattern_rate is positive,
  * item_rate_threshold must not exceed it. Capacity and work limits must be
- * positive and within the ranges below; the conservative payload bound must
- * fit max_memory_bytes. */
+ * positive and within the ranges below. In conservative memory mode the
+ * configured worst-case payload bound must fit max_memory_bytes. */
 typedef struct {
   double ewma_half_life_ms;    /* positive half-life for continuous decay */
   double item_rate_threshold;  /* minimum decayed item count for gating */
@@ -77,8 +77,9 @@ typedef struct {
   uint64_t pattern_replacements;
   size_t memory_current_bytes; /* current requested payload, excludes allocator
                                   overhead */
-  size_t memory_bound_bytes;   /* includes worst-case transient reservations */
-  size_t active_groups;        /* current number of tracked groups */
+  size_t
+      memory_bound_bytes; /* static bound or dynamic cap, includes transients */
+  size_t active_groups;   /* current number of tracked groups */
 } bishfpm_stats_t;
 
 /* One first-detected reason per rejected call on a non-NULL engine.
@@ -121,8 +122,33 @@ typedef struct bishfpm bishfpm_t;
 /* initialize default config */
 void bishfpm_config_default(bishfpm_config_t *cfg);
 
+typedef enum {
+  BISHFPM_STORE_SS = 0,
+  BISHFPM_STORE_FSS = 1 /* experimental general-itemset filtered Space-Saving */
+} bishfpm_store_t;
+typedef enum {
+  BISHFPM_MEMORY_CONSERVATIVE = 0,
+  BISHFPM_MEMORY_DYNAMIC = 1
+} bishfpm_memory_mode_t;
+typedef struct {
+  bishfpm_store_t store;
+  uint32_t sketch_width; /* FSS: 1..2^24; SS: zero. */
+  bishfpm_memory_mode_t memory_mode;
+} bishfpm_options_t;
+/* Defaults select SS and the existing conservative memory mode. */
+void bishfpm_options_default(bishfpm_options_t *);
+/* Opt-in options; NULL options preserve the existing constructor behavior.
+ * Dynamic mode caps each engine-owned requested allocation, including staging
+ * and concurrent old/new buffers, rather than requiring the configured maximum
+ * group population to fit at construction. Required reservation denial rejects
+ * an event before counts change. Optional cooldown allocation denial retains
+ * active protection and can suppress alerts after count acceptance. */
+bishfpm_t *bishfpm_create_with_options(const bishfpm_config_t *,
+                                       const bishfpm_options_t *);
+
 /* Engine lifecycle. Constructors return NULL for invalid configuration,
- * an excessive conservative payload bound, or allocation failure.
+ * an excessive payload requirement for the selected memory mode, or allocation
+ * failure. Existing constructors use conservative memory mode.
  * bishfpm_create(NULL) uses defaults. */
 bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg);
 /* Opt-in numeric pair backends; cfg must have min/max itemset order 2.
@@ -148,13 +174,20 @@ typedef struct {
 bishfpm_t *bishfpm_create_pairs(const bishfpm_config_t *,
                                 const bishfpm_pair_options_t *);
 
+/* Pair selection stays in pair_options; engine options must select SS with
+ * sketch_width zero here, and may select either memory mode. */
+bishfpm_t *bishfpm_create_pairs_with_options(const bishfpm_config_t *,
+                                             const bishfpm_pair_options_t *,
+                                             const bishfpm_options_t *);
+
 typedef struct {
   double lower, upper;
   int resident;
   int known; /* 0: no certified interval */
 } bishfpm_count_bounds_t;
 /* Returns 1 for a valid query, including absent keys. Threshold/FSS absence has
- * lower=0, upper=the decayed absent-history bound. Invalid queries return 0.
+ * lower=0, upper=the decayed absent-history bound (including general FSS).
+ * Invalid queries return 0.
  * Bounds cover evaluated candidates; disable both marginal gates for full
  * transaction support. */
 int bishfpm_pattern_bounds(bishfpm_t *, const char *group, const char *pattern,
@@ -218,6 +251,50 @@ size_t bishfpm_prune_pairs(bishfpm_t *, const char *group_key, uint64_t now_ms,
  * were pruned. Nonfinite/nonpositive min_rate and reentrant calls are no-ops.
  */
 size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate);
+
+typedef struct {
+  size_t retained_items, item_limit, remaining_items;
+  int lifetime_retention; /* numeric dictionaries keep IDs until group removal
+                           */
+} bishfpm_vocabulary_stats_t;
+/* Read-only; returns 1 for an existing group. Missing/invalid input returns 0
+ * without changing output. Retained includes dormant numeric identities. */
+int bishfpm_get_vocabulary_stats(const bishfpm_t *, const char *group,
+                                 bishfpm_vocabulary_stats_t *);
+
+typedef struct {
+  uint64_t candidates_evaluated, resident_updates, admissions;
+  uint64_t replacements, filtered_updates, rejected_updates,
+      zero_weight_queries;
+  size_t resident_patterns, resident_capacity;
+} bishfpm_pattern_pressure_t;
+/* General SS/FSS only. NULL group selects engine totals, including counters
+ * from removed groups; a named group selects its current lifetime. Gauges
+ * describe currently retained groups. Admissions include replacements.
+ * evaluated = resident_updates + admissions + filtered_updates +
+ * rejected_updates
+ *             + zero_weight_queries.
+ * Filtered updates leave a nonresident candidate in the FSS sketch; rejected
+ * updates overflow a store count. Zero effective weights count separately as
+ * queries without changing store state. No time is advanced by this snapshot.
+ * Missing groups, numeric engines, or invalid arguments return 0 and leave out
+ * unchanged. Read-only snapshots do not reset counters. Differences between
+ * snapshots give interval replacement/filter rates, not measured recall. */
+int bishfpm_get_pattern_pressure(const bishfpm_t *, const char *group,
+                                 bishfpm_pattern_pressure_t *out);
+
+typedef struct {
+  bishfpm_memory_mode_t mode;
+  size_t current_bytes, peak_bytes, limit_bytes;
+  uint64_t allocation_denials, event_rejections;
+} bishfpm_memory_stats_t;
+/* Dynamic mode reports exact current and peak requested payload. Denials
+ * include optional maintenance; event_rejections counts required reservations
+ * denied by the memory cap. Such event failures also count in the existing
+ * allocation_failure reason and budget_rejections statistic. Conservative mode
+ * reports current payload and configured limit; peak/denial fields are zero
+ * because it uses a static bound rather than an allocation ledger. */
+void bishfpm_get_memory_stats(const bishfpm_t *, bishfpm_memory_stats_t *);
 
 /* query engine statistics */
 void bishfpm_get_stats(const bishfpm_t *engine, bishfpm_stats_t *out);

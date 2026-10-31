@@ -15,13 +15,10 @@ typedef struct {
   double rate, error;
   uint64_t last_time_ms;
 } compact_entry_t;
-typedef struct {
-  double count;
-  uint64_t time_ms;
-} bishfpm_sketch_cell_t;
 
 typedef struct {
   uint32_t k, heap_size, sketch_width;
+  bishfpm_memory_budget_t *budget;
   bishfpm_pair_store_t kind;
   double half_life_ms;
   /* Maximum upper count removed by pruning, decayed to max_time_ms. SS and
@@ -50,6 +47,9 @@ typedef struct {
 BISHFPM_PRIVATE size_t compact_bytes(uint32_t, uint32_t, bishfpm_pair_store_t);
 BISHFPM_PRIVATE compact_t *compact_new(uint32_t, double, uint32_t,
                                        bishfpm_pair_store_t, double);
+BISHFPM_PRIVATE compact_t *compact_new_budget(uint32_t, double, uint32_t,
+                                              bishfpm_pair_store_t, double,
+                                              bishfpm_memory_budget_t *);
 BISHFPM_PRIVATE void compact_free(compact_t *);
 /* Numeric entries cache the supplied hash. */
 BISHFPM_PRIVATE topk_result_t compact_add(compact_t *, uint64_t, uint64_t,

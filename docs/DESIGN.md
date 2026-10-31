@@ -187,7 +187,7 @@ Patterns use sorted unique items joined by unit separators (`0x1f`), which canno
 appear inside an item. Use this canonical encoding as identity; formatted output
 is for display and can be truncated or ambiguous. Hash collisions are resolved
 using complete identities. Representation limits are defined in
-[`bishfpm_limits.h`](../include/bishfpm_limits.h).
+`bishfpm_limits.h`.
 
 ### Numeric identities
 
@@ -206,8 +206,8 @@ The engine sends each evaluated candidate's identity, discounted weight, and
 common group time to its store. The store returns residency and a count estimate
 with any available uncertainty bounds. Its retention policy determines which
 patterns remain available under the configured memory limit. See the
-[README](../README.md#choosing-a-store) for store selection and
-[prior art](PRIOR_ART.md#ancestry) for algorithm lineage.
+`README.md` (Choosing a store) for store selection and
+`PRIOR_ART.md` (Ancestry) for algorithm lineage.
 
 Bounds cover the evaluated candidate stream: only candidates whose items pass
 the marginal gates receive updates. Disabling both gates includes every
@@ -303,27 +303,36 @@ capacity for the complete event. It only forgets pairs whose upper counts are at
 or below `forget_below`; if too few slots can be made available, the event is
 rejected before counts change.
 
-See the [public API](../include/bishfpm.h) for pruning options and store-specific
+See the public API in `bishfpm.h` for pruning options and store-specific
 cutoff behavior.
 
 ## Resource limits and complexity
 
 The engine bounds groups, marginal identities, resident patterns, notification
 state, input width, candidate work, and library allocation payload. See the
-[README configuration guidance](../README.md#configuration) for constructor
-constraints, the [public API](../include/bishfpm.h) for configuration fields, and
-[`bishfpm_limits.h`](../include/bishfpm_limits.h) for representation limits.
+configuration guidance in `README.md` for constructor
+constraints, the public API in `bishfpm.h` for configuration fields, and
+`bishfpm_limits.h` for representation limits.
 
 Admission sums `binomial(unique_items, order)` over configured orders before
 applying gates. This bounds the worst-case expansion for the whole event;
 exceeding the budget rejects the event rather than processing a partial set of
 candidates.
 
-The constructor checks a conservative payload bound against `max_memory_bytes`,
-including retained state, workspaces, and temporary allocations that may coexist.
-Reported current payload can be below this bound. Allocator overhead, stack,
-caller buffers, callback allocations, and other engines are outside the budget;
-it is not a bound on process memory.
+The default conservative memory mode checks a configured worst-case payload
+bound against `max_memory_bytes` at construction, including retained state,
+workspaces, and temporary allocations that may coexist. Reported current payload
+can be below this bound.
+
+Opt-in dynamic memory mode requires the initial engine payload to fit, then
+charges every engine-owned allocation against the cap as the engine grows.
+Charges include staging and simultaneous old/new buffers. Denial of a required
+reservation rejects the event before counts change; denial of optional cooldown
+maintenance can suppress alerts after acceptance while preserving active
+protection. See Optional allocation ledger and general FSS below for details.
+
+In both modes, allocator overhead, stack, caller buffers, callback allocations,
+and other engines are outside the budget; it is not a bound on process memory.
 
 Preparation sorts items, typically `O(M log M)`. Candidate cost depends on store
 updates and notification checks. Collisions can lengthen lookups, and maintenance
@@ -345,7 +354,7 @@ Statistics distinguish event acceptance and rejection, candidate work,
 notification decisions and delivery, and memory use. A separate cumulative
 rejection snapshot identifies why ingestion failed. Suppressed notifications
 are not rejected events. Counter fields and query functions are defined in the
-[public API](../include/bishfpm.h).
+public API in `bishfpm.h`.
 
 ## Ownership and concurrency
 
@@ -365,10 +374,57 @@ to the application.
 
 ## API reference
 
-The engine API is declared in [`bishfpm.h`](../include/bishfpm.h). Independent
+The engine API is declared in `bishfpm.h`. Independent
 counters, stores, itemset helpers, and arenas are available through
-[`bishfpm_lowlevel.h`](../include/bishfpm_lowlevel.h) and its component headers,
+`bishfpm_lowlevel.h` and its component headers,
 which document their ownership and use.
 
-For algorithm ancestry, see [prior art](PRIOR_ART.md). For store selection and
-build commands, see the [README](../README.md).
+For algorithm ancestry, see `PRIOR_ART.md`. For store selection and
+build commands, see the `README.md`.
+
+## Optional allocation ledger and general FSS
+
+General-store pressure snapshots keep per-group cumulative counters in group
+metadata. Engine totals combine active groups with counters retired during group
+removal, so the hot path updates only one counter set. Both allocating and
+in-place pruning retire counts before freeing a group. Gauges are computed on
+read. Numeric engines return unsupported rather than reinterpreting their
+different admission policies. A private accepted-update flag separates count
+overflow from FSS filtering without changing the public count-bound layout.
+
+`bishfpm_options_t` selects two independent extensions without changing the old
+configuration or constructor ABI. The general store can use experimental FSS;
+SS remains the default. FSS retains a decayed bucket upper bound for absent keys,
+transfers evicted/pruned upper counts into buckets, and inherits uncertainty on
+admission even into free slots after pruning. Filtered misses update only the
+sketch and cannot promote. Queries do not advance time. Guards stage all clock,
+bucket, and heap changes until the input can be represented. Reseeding bucket
+history is unsupported because its identities are unavailable; reset starts a
+new epoch before changing the seed.
+
+Conservative memory mode still checks configured worst-case payload at creation.
+Dynamic mode instead maintains an allocation ledger stored in the engine. All
+engine-owned allocations receive that ledger, including nested rate tables,
+numeric stores, and owned group arenas. Arena suballocations are already charged
+as part of the buffer and are not charged twice. The allocator checks each new
+request against the remaining budget before calling the OS and charges only a
+successful request. Releases subtract its exact payload. The high-water mark
+therefore includes simultaneous old/new arrays and staging/key copies, rather
+than assuming one capacity doubling per event. Caller-owned allocations are
+outside this ledger. The independent public payload snapshot can be compared
+with the ledger; allocator-wrapping tests also verify it against actual requests.
+
+Group/marginal reservations still precede counter mutation. A denied required
+request rejects the event atomically for counts, identities, and watermarks;
+previously completed table growth can remain allocated. If a replacement group or marginal table cannot fit, dynamic pruning releases
+weak entries in place with backward-shift deletion and retains the old capacity.
+This permits reclamation without spare budget. Cooldown maintenance/growth occurs after acceptance: denial can suppress
+notifications but preserves existing cooldown protection. Such optional denials
+count in memory diagnostics, not event rejections. Failed OS allocations are
+separate from budget denials. Group removal releases all owned state and makes
+those budget bytes available to other groups.
+
+Vocabulary diagnostics count retained dictionary strings, including dormant
+numeric entries. Numeric IDs are still stable for a group's lifetime. Memory
+budgeting does not introduce ID recycling, history retirement, Apriori update
+skipping, or a different notification ordering policy.

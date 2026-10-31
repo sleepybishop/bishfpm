@@ -142,17 +142,38 @@ static void heapify_up(bishfpm_topk_t *topk, uint32_t idx, uint64_t now_ms) {
 
 /* sift down in min-heap */
 static void heapify_down(bishfpm_topk_t *topk, uint32_t idx, uint64_t now_ms) {
+  uint32_t child = 2 * idx + 1;
+  if (child >= topk->heap_size)
+    return;
+  double held_rate = item_rate(&topk->heap[idx], now_ms, topk->half_life_ms);
+  double child_rate = item_rate(&topk->heap[child], now_ms, topk->half_life_ms);
+  if (child + 1 < topk->heap_size) {
+    double right_rate =
+        item_rate(&topk->heap[child + 1], now_ms, topk->half_life_ms);
+    if (right_rate < child_rate) {
+      child++;
+      child_rate = right_rate;
+    }
+  }
+  /* Most resident updates do not move. Avoid copying the full pattern buffer
+   * or probing its map slot until the first strict comparison requires it. */
+  if (!(child_rate < held_rate))
+    return;
   /* Carry the updated entry through a hole instead of swapping two complete
    * pattern buffers at every level. Probe chains do not change, only indices.
    * Strict comparisons retain the existing tie and enumeration behavior. */
   bishfpm_heap_entry_t held = topk->heap[idx];
   size_t held_slot = slot_for_index(topk, idx);
-  double held_rate = item_rate(&held, now_ms, topk->half_life_ms);
   uint32_t hole = idx;
-  while (2 * hole + 1 < topk->heap_size) {
-    uint32_t child = 2 * hole + 1;
-    double child_rate =
-        item_rate(&topk->heap[child], now_ms, topk->half_life_ms);
+  for (;;) {
+    size_t child_slot = slot_for_index(topk, child);
+    topk->heap[hole] = topk->heap[child];
+    topk->slot_map[child_slot].heap_idx = hole;
+    hole = child;
+    child = 2 * hole + 1;
+    if (child >= topk->heap_size)
+      break;
+    child_rate = item_rate(&topk->heap[child], now_ms, topk->half_life_ms);
     if (child + 1 < topk->heap_size) {
       double right_rate =
           item_rate(&topk->heap[child + 1], now_ms, topk->half_life_ms);
@@ -163,15 +184,9 @@ static void heapify_down(bishfpm_topk_t *topk, uint32_t idx, uint64_t now_ms) {
     }
     if (!(child_rate < held_rate))
       break;
-    size_t child_slot = slot_for_index(topk, child);
-    topk->heap[hole] = topk->heap[child];
-    topk->slot_map[child_slot].heap_idx = hole;
-    hole = child;
   }
-  if (hole != idx) {
-    topk->heap[hole] = held;
-    topk->slot_map[held_slot].heap_idx = hole;
-  }
+  topk->heap[hole] = held;
+  topk->slot_map[held_slot].heap_idx = hole;
 }
 
 static void topk_init(bishfpm_topk_t *topk, uint32_t k, double half_life_ms,
@@ -182,41 +197,55 @@ static void topk_init(bishfpm_topk_t *topk, uint32_t k, double half_life_ms,
   topk->arena_backed = arena_backed;
 }
 
-/* Owned and borrowed allocation paths share layout and initialization. */
-bishfpm_topk_t *bishfpm_topk_new_arena(bishfpm_arena_t *a, uint32_t k,
-                                       double half_life_ms) {
+static bishfpm_topk_t *topk_new(bishfpm_arena_t *a, uint32_t k, double half,
+                                uint32_t width, uint64_t seed) {
   topk_layout_t layout;
-  if (!a || !topk_layout(k, half_life_ms, &layout))
+  if (!topk_layout_configured(k, half, width, &layout))
     return NULL;
-  uint8_t *saved = a->beg;
-  bishfpm_topk_t *topk = bishfpm_alloc_array(a, bishfpm_topk_t, 1);
-  if (topk) {
-    topk_init(topk, k, half_life_ms, layout.slot_cap, true);
-    topk->heap = bishfpm_alloc_array(a, bishfpm_heap_entry_t, k);
-    topk->slot_map =
-        bishfpm_alloc_array(a, bishfpm_slot_entry_t, layout.slot_cap);
-    if (topk->heap && topk->slot_map)
-      return topk;
-  }
-  a->beg = saved;
-  return NULL;
-}
-
-bishfpm_topk_t *bishfpm_topk_new(uint32_t k, double half_life_ms) {
-  topk_layout_t layout;
-  if (!topk_layout(k, half_life_ms, &layout))
-    return NULL;
-  bishfpm_topk_t *topk = calloc(1, sizeof(*topk));
+  uint8_t *saved = a ? a->beg : NULL;
+  bishfpm_topk_t *topk =
+      a ? bishfpm_alloc_array(a, bishfpm_topk_t, 1) : calloc(1, sizeof(*topk));
   if (!topk)
     return NULL;
-  topk_init(topk, k, half_life_ms, layout.slot_cap, false);
-  topk->heap = calloc(1, layout.heap_bytes);
-  topk->slot_map = calloc(1, layout.map_bytes);
-  if (!topk->heap || !topk->slot_map) {
-    bishfpm_topk_free(topk);
+  topk_init(topk, k, half, layout.slot_cap, a != NULL);
+  topk->hash_seed = seed;
+  topk->sketch_width = width;
+  topk->heap = a ? bishfpm_alloc_array(a, bishfpm_heap_entry_t, k)
+                 : calloc(1, layout.heap_bytes);
+  topk->slot_map =
+      a ? bishfpm_alloc_array(a, bishfpm_slot_entry_t, layout.slot_cap)
+        : calloc(1, layout.map_bytes);
+  if (width)
+    topk->sketch = a ? bishfpm_alloc_array(a, bishfpm_sketch_cell_t, width)
+                     : calloc(1, layout.sketch_bytes);
+  if (!topk->heap || !topk->slot_map || (width && !topk->sketch)) {
+    if (a)
+      a->beg = saved;
+    else
+      bishfpm_topk_free(topk);
     return NULL;
   }
   return topk;
+}
+
+bishfpm_topk_t *bishfpm_topk_new_arena(bishfpm_arena_t *a, uint32_t k,
+                                       double half) {
+  return a ? topk_new(a, k, half, 0, 0) : NULL;
+}
+
+bishfpm_topk_t *bishfpm_topk_new(uint32_t k, double half) {
+  return topk_new(NULL, k, half, 0, 0);
+}
+
+bishfpm_topk_t *bishfpm_topk_new_fss(uint32_t k, double half, uint32_t width,
+                                     uint64_t seed) {
+  return width ? topk_new(NULL, k, half, width, seed) : NULL;
+}
+
+bishfpm_topk_t *bishfpm_topk_new_fss_arena(bishfpm_arena_t *a, uint32_t k,
+                                           double half, uint32_t width,
+                                           uint64_t seed) {
+  return a && width ? topk_new(a, k, half, width, seed) : NULL;
 }
 
 /* free top-k structure */
@@ -225,6 +254,7 @@ void bishfpm_topk_free(bishfpm_topk_t *topk) {
     return;
   }
   if (!topk->arena_backed) {
+    free(topk->sketch);
     free(topk->heap);
     free(topk->slot_map);
     free(topk);
@@ -241,16 +271,129 @@ void bishfpm_topk_reset(bishfpm_topk_t *topk) {
   topk->heap_size = 0;
   topk->max_time_ms = 0;
   topk->omitted_bound = 0;
+  topk->sketch_total = 0;
+  topk->history_started = false;
+  if (topk->sketch)
+    memset(topk->sketch, 0, topk->sketch_width * sizeof(*topk->sketch));
 }
 
-/* set hash seed */
+int bishfpm_topk_try_set_seed(bishfpm_topk_t *topk, uint64_t seed) {
+  if (!topk ||
+      (topk->sketch_width && topk->history_started && seed != topk->hash_seed))
+    return 0;
+  topk->hash_seed = seed;
+  for (uint32_t i = 0; i < topk->heap_size; i++)
+    topk->heap[i].hash = bishfpm_hash_str(topk->heap[i].pattern, seed);
+  slot_map_rebuild(topk);
+  return 1;
+}
+
 void bishfpm_topk_set_seed(bishfpm_topk_t *topk, uint64_t seed) {
-  if (topk) {
-    topk->hash_seed = seed;
-    for (uint32_t i = 0; i < topk->heap_size; i++)
-      topk->heap[i].hash = bishfpm_hash_str(topk->heap[i].pattern, seed);
-    slot_map_rebuild(topk);
+  (void)bishfpm_topk_try_set_seed(topk, seed);
+}
+
+static size_t sketch_bucket(const bishfpm_topk_t *t, uint64_t hash) {
+  return bishfpm_splitmix64(&hash) % t->sketch_width;
+}
+
+/* Stored counts are finite and nonnegative. Match rate_decay exactly while
+ * avoiding its out-of-line call for the many updates at one event watermark. */
+static inline double decay_since(double count, uint64_t then, uint64_t now,
+                                 double half) {
+  return now == then ? count : bishfpm_rate_decay(count, now - then, half);
+}
+
+static double sketch_bound(const bishfpm_topk_t *t, uint64_t hash,
+                           uint64_t now) {
+  const bishfpm_sketch_cell_t *cell = &t->sketch[sketch_bucket(t, hash)];
+  return decay_since(cell->count, cell->time_ms, now, t->half_life_ms);
+}
+
+static void sketch_record(bishfpm_topk_t *t, uint64_t hash, double upper,
+                          uint64_t now) {
+  bishfpm_sketch_cell_t *cell = &t->sketch[sketch_bucket(t, hash)];
+  cell->count = fmax(
+      upper, decay_since(cell->count, cell->time_ms, now, t->half_life_ms));
+  cell->time_ms = now;
+}
+
+/* Same bucket-history invariants and staged guards as numeric FSS. */
+static topk_result_t fss_add(bishfpm_topk_t *t, const char *pattern,
+                             size_t length, double increment,
+                             uint64_t timestamp) {
+  topk_result_t r = {0};
+  uint64_t now = effective_time(timestamp, t->max_time_ms);
+  uint64_t hash = bishfpm_murmur3_64(pattern, length, t->hash_seed);
+  double weight = decay_since(increment, timestamp, now, t->half_life_ms);
+  double total =
+      decay_since(t->sketch_total, t->max_time_ms, now, t->half_life_ms);
+  if (weight > DBL_MAX - total)
+    return r;
+  uint32_t idx;
+  bool present = slot_map_find(t, pattern, hash, &idx);
+  bool full = t->heap_size == t->k;
+  double alpha = present ? 0 : sketch_bound(t, hash, now);
+  double minimum =
+      full && !present ? item_rate(&t->heap[0], now, t->half_life_ms) : 0;
+  double error = alpha;
+  double rate = present ? item_rate(&t->heap[idx], now, t->half_life_ms) : 0;
+  if (!present && full && alpha + weight >= minimum &&
+      sketch_bucket(t, hash) == sketch_bucket(t, t->heap[0].hash))
+    error = fmax(alpha, minimum);
+  if (weight > DBL_MAX - (present ? rate : error))
+    return r;
+  t->omitted_bound =
+      decay_since(t->omitted_bound, t->max_time_ms, now, t->half_life_ms);
+  t->max_time_ms = now;
+  t->sketch_total = total + weight;
+  t->history_started = true;
+  r.accepted = true;
+  r.hash = hash;
+  r.time_ms = now;
+  if (present) {
+    bishfpm_heap_entry_t *entry = &t->heap[idx];
+    entry->error =
+        decay_since(entry->error, entry->last_time_ms, now, t->half_life_ms);
+    entry->rate = rate + weight;
+    entry->last_time_ms = now;
+    r.present = r.was_present = true;
+    r.upper = entry->rate;
+    r.lower = fmax(0, entry->rate - entry->error);
+    r.error = r.upper - r.lower;
+    heapify_down(t, idx, now);
+    return r;
   }
+  if (full && alpha + weight < minimum) {
+    bishfpm_sketch_cell_t *cell = &t->sketch[sketch_bucket(t, hash)];
+    cell->count = alpha + weight;
+    cell->time_ms = now;
+    r.upper = r.error = cell->count;
+    return r;
+  }
+  if (full) {
+    sketch_record(t, t->heap[0].hash, minimum, now);
+    slot_map_remove(t, t->heap[0].hash, 0);
+    idx = 0;
+  } else {
+    idx = t->heap_size++;
+  }
+  bishfpm_heap_entry_t *entry = &t->heap[idx];
+  memcpy(entry->pattern, pattern, length + 1);
+  entry->hash = hash;
+  entry->rate = error + weight;
+  entry->error = error;
+  entry->last_time_ms = now;
+  slot_map_set(t, hash, idx);
+  r.present = true;
+  r.replaced = full;
+  r.upper = entry->rate;
+  r.lower = fmax(0, r.upper - error);
+  r.error = r.upper - r.lower;
+  if (full)
+    heapify_down(t, idx, now);
+  else
+    heapify_up(t, idx, now);
+  return r;
 }
 
 /* add item with increment/weight */
@@ -272,6 +415,8 @@ topk_result_t topk_add_sized(bishfpm_topk_t *topk, const char *pattern,
   topk_result_t result = {0};
   if (increment == 0.0)
     return topk_query_result(topk, pattern, now_ms);
+  if (topk->sketch_width)
+    return fss_add(topk, pattern, length, increment, now_ms);
   uint64_t event_time = now_ms;
   now_ms = effective_time(now_ms, topk->max_time_ms);
   /* Stage clock and history changes until the count can be represented. */
@@ -291,6 +436,7 @@ topk_result_t topk_add_sized(bishfpm_topk_t *topk, const char *pattern,
       return result;
     topk->omitted_bound = omitted_bound;
     topk->max_time_ms = now_ms;
+    result.accepted = true;
     item->error = bishfpm_rate_decay(item->error, now_ms - item->last_time_ms,
                                      topk->half_life_ms);
     item->rate = decayed + weight;
@@ -310,6 +456,7 @@ topk_result_t topk_add_sized(bishfpm_topk_t *topk, const char *pattern,
     return result;
   topk->omitted_bound = omitted_bound;
   topk->max_time_ms = now_ms;
+  result.accepted = true;
   double error = admission;
   if (topk->heap_size < topk->k) {
     idx = topk->heap_size++;
@@ -363,8 +510,12 @@ topk_result_t topk_query_result(const bishfpm_topk_t *topk, const char *pattern,
   result.time_ms = effective_time(now_ms, topk->max_time_ms);
   result.hash = bishfpm_murmur3_64(pattern, length, topk->hash_seed);
   uint32_t idx;
-  if (!slot_map_find(topk, pattern, result.hash, &idx))
+  if (!slot_map_find(topk, pattern, result.hash, &idx)) {
+    if (topk->sketch_width)
+      result.upper = result.error =
+          sketch_bound(topk, result.hash, result.time_ms);
     return result;
+  }
   const bishfpm_heap_entry_t *item = &topk->heap[idx];
   result.present = result.was_present = true;
   result.upper = item_rate(item, result.time_ms, topk->half_life_ms);
@@ -373,6 +524,17 @@ topk_result_t topk_query_result(const bishfpm_topk_t *topk, const char *pattern,
                                     topk->half_life_ms);
   result.error = result.upper - result.lower;
   return result;
+}
+
+int bishfpm_topk_bounds(const bishfpm_topk_t *topk, const char *pattern,
+                        uint64_t now, bishfpm_topk_bounds_t *out) {
+  if (!topk || !pattern || !out || !pattern[0] ||
+      strnlen(pattern, BISHFPM_TOPK_MAX_STR) >= BISHFPM_TOPK_MAX_STR)
+    return 0;
+  topk_result_t r = topk_query_result(topk, pattern, now);
+  *out = (bishfpm_topk_bounds_t){r.lower, r.upper, r.error, r.present,
+                                 r.present || topk->sketch_width != 0};
+  return 1;
 }
 
 double bishfpm_topk_query_lower(bishfpm_topk_t *topk, const char *pattern,
@@ -402,7 +564,8 @@ uint32_t bishfpm_topk_count(const bishfpm_topk_t *topk) {
 
 size_t bishfpm_topk_storage_bytes(const bishfpm_topk_t *topk) {
   return topk ? sizeof(*topk) + topk->k * sizeof(*topk->heap) +
-                    topk->slot_map_cap * sizeof(*topk->slot_map)
+                    topk->slot_map_cap * sizeof(*topk->slot_map) +
+                    topk->sketch_width * sizeof(*topk->sketch)
               : 0;
 }
 
@@ -419,6 +582,8 @@ size_t bishfpm_topk_prune(bishfpm_topk_t *topk, uint64_t now_ms,
     now_ms = topk->max_time_ms;
   topk->omitted_bound = bishfpm_rate_decay(
       topk->omitted_bound, now_ms - topk->max_time_ms, topk->half_life_ms);
+  topk->sketch_total = bishfpm_rate_decay(
+      topk->sketch_total, now_ms - topk->max_time_ms, topk->half_life_ms);
   topk->max_time_ms = now_ms;
   size_t pruned = 0;
   uint32_t i = 0;
@@ -427,6 +592,8 @@ size_t bishfpm_topk_prune(bishfpm_topk_t *topk, uint64_t now_ms,
     if (r < min_rate) {
       if (r > topk->omitted_bound)
         topk->omitted_bound = r;
+      if (topk->sketch_width)
+        sketch_record(topk, topk->heap[i].hash, r, now_ms);
       /* move last element into this position */
       uint32_t last = topk->heap_size - 1;
       if (i != last) {

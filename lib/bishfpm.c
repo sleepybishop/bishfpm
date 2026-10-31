@@ -78,6 +78,7 @@ static void cooldown_set_identity(bishfpm_cooldown_entry_t *entry,
 /* internal group representation */
 typedef struct {
   char *group_key;
+  bishfpm_memory_budget_t *budget;
   uint64_t hash;
   bishfpm_rate_t group_rate;
   bishfpm_rate_table_t *item_rates;
@@ -89,6 +90,7 @@ typedef struct {
   /* Lower bound on the oldest trigger; refreshed during maintenance. */
   uint64_t cooldown_oldest_ms;
   uint64_t max_time_ms;
+  bishfpm_pattern_pressure_t pressure;
 } bishfpm_group_t;
 
 typedef enum {
@@ -106,6 +108,8 @@ typedef enum {
 /* engine instance */
 struct bishfpm {
   bishfpm_config_t cfg;
+  bishfpm_options_t options;
+  bishfpm_memory_budget_t memory;
   bool numeric_pairs;
   bishfpm_pair_options_t pair_options;
   uint64_t pair_capacity_rejections, pairs_forgotten;
@@ -114,9 +118,30 @@ struct bishfpm {
   size_t group_count;
   prepared_event_t workspace;
   bishfpm_stats_t stats;
+  bishfpm_pattern_pressure_t pressure; /* Counters from removed groups only. */
   uint64_t rejected[REJECT_REASON_COUNT];
   bool busy;
 };
+
+static void pressure_add(bishfpm_pattern_pressure_t *to,
+                         const bishfpm_pattern_pressure_t *from) {
+  to->candidates_evaluated += from->candidates_evaluated;
+  to->resident_updates += from->resident_updates;
+  to->admissions += from->admissions;
+  to->replacements += from->replacements;
+  to->filtered_updates += from->filtered_updates;
+  to->rejected_updates += from->rejected_updates;
+  to->zero_weight_queries += from->zero_weight_queries;
+}
+
+static bishfpm_memory_budget_t *engine_budget(bishfpm_t *e) {
+  return e->options.memory_mode == BISHFPM_MEMORY_DYNAMIC ? &e->memory : NULL;
+}
+
+void bishfpm_options_default(bishfpm_options_t *o) {
+  if (o)
+    *o = (bishfpm_options_t){BISHFPM_STORE_SS, 0, BISHFPM_MEMORY_CONSERVATIVE};
+}
 
 /* default config initialization */
 void bishfpm_config_default(bishfpm_config_t *cfg) {
@@ -222,9 +247,11 @@ static bool validate_pairs(const bishfpm_config_t *cfg,
  * and caller buffers are outside this budget. Limits above bound each factor.
  */
 static size_t memory_bound(const bishfpm_config_t *c,
-                           const bishfpm_pair_options_t *pairs) {
+                           const bishfpm_pair_options_t *pairs,
+                           uint32_t sketch_width) {
   topk_layout_t layout;
-  if (!topk_layout(c->topk_k, c->ewma_half_life_ms, &layout))
+  if (!topk_layout_configured(c->topk_k, c->ewma_half_life_ms, sketch_width,
+                              &layout))
     return SIZE_MAX;
   size_t pair_bytes =
       pairs ? compact_bytes(pairs->capacity, pairs->sketch_width, pairs->store)
@@ -264,7 +291,19 @@ static size_t memory_bound(const bishfpm_config_t *c,
 
 /* create engine instance */
 static bishfpm_t *create_options(const bishfpm_config_t *cfg,
-                                 const bishfpm_pair_options_t *pairs) {
+                                 const bishfpm_pair_options_t *pairs,
+                                 const bishfpm_options_t *options) {
+  bishfpm_options_t o;
+  bishfpm_options_default(&o);
+  if (options)
+    o = *options;
+  if ((o.store != BISHFPM_STORE_SS && o.store != BISHFPM_STORE_FSS) ||
+      (o.memory_mode != BISHFPM_MEMORY_CONSERVATIVE &&
+       o.memory_mode != BISHFPM_MEMORY_DYNAMIC) ||
+      o.sketch_width > (1U << 24) ||
+      (o.store == BISHFPM_STORE_FSS ? !o.sketch_width : o.sketch_width != 0) ||
+      (pairs && o.store != BISHFPM_STORE_SS))
+    return NULL;
   bishfpm_config_t c;
   if (cfg) {
     c = *cfg;
@@ -278,7 +317,11 @@ static bishfpm_t *create_options(const bishfpm_config_t *cfg,
 
   if (pairs && !validate_pairs(&c, pairs))
     return NULL;
-  size_t bound = memory_bound(&c, pairs);
+  size_t bound = o.memory_mode == BISHFPM_MEMORY_DYNAMIC
+                     ? sizeof(bishfpm_t) +
+                           INITIAL_GROUP_CAPACITY * sizeof(bishfpm_group_t) +
+                           workspace_bytes(c.max_event_items)
+                     : memory_bound(&c, pairs, o.sketch_width);
   if (bound == SIZE_MAX || bound > c.max_memory_bytes)
     return NULL;
 
@@ -288,22 +331,31 @@ static bishfpm_t *create_options(const bishfpm_config_t *cfg,
   }
 
   engine->cfg = c;
+  engine->options = o;
+  engine->memory.limit = c.max_memory_bytes;
+  engine->memory.current = engine->memory.peak = sizeof(*engine);
+  bishfpm_memory_budget_t *budget = engine_budget(engine);
   engine->numeric_pairs = pairs != NULL;
   if (pairs)
     engine->pair_options = *pairs;
   engine->busy = false; /* construction has not published the engine */
-  engine->stats.memory_bound_bytes = bound;
+  engine->stats.memory_bound_bytes = budget ? c.max_memory_bytes : bound;
   engine->group_cap = INITIAL_GROUP_CAPACITY;
-  engine->groups = calloc(engine->group_cap, sizeof(bishfpm_group_t));
+  engine->groups =
+      memory_calloc(budget, engine->group_cap, sizeof(bishfpm_group_t));
   if (!engine->groups) {
-    free(engine);
+    memory_free(budget, engine, sizeof(*engine));
     return NULL;
   }
 
-  engine->workspace.items = calloc(c.max_event_items, sizeof(prepared_item_t));
-  engine->workspace.keys = calloc(c.max_event_items, sizeof(const char *));
-  engine->workspace.lengths = calloc(c.max_event_items, sizeof(size_t));
-  engine->workspace.ids = calloc(c.max_event_items, sizeof(uint32_t));
+  engine->workspace.items =
+      memory_calloc(budget, c.max_event_items, sizeof(prepared_item_t));
+  engine->workspace.keys =
+      memory_calloc(budget, c.max_event_items, sizeof(const char *));
+  engine->workspace.lengths =
+      memory_calloc(budget, c.max_event_items, sizeof(size_t));
+  engine->workspace.ids =
+      memory_calloc(budget, c.max_event_items, sizeof(uint32_t));
   if (!engine->workspace.items || !engine->workspace.keys ||
       !engine->workspace.lengths || !engine->workspace.ids) {
     bishfpm_free(engine);
@@ -315,11 +367,21 @@ static bishfpm_t *create_options(const bishfpm_config_t *cfg,
 
 bishfpm_t *bishfpm_create_pairs(const bishfpm_config_t *cfg,
                                 const bishfpm_pair_options_t *pairs) {
-  return pairs ? create_options(cfg, pairs) : NULL;
+  return pairs ? create_options(cfg, pairs, NULL) : NULL;
 }
 
 bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg) {
-  return create_options(cfg, NULL);
+  return create_options(cfg, NULL, NULL);
+}
+
+bishfpm_t *bishfpm_create_with_options(const bishfpm_config_t *c,
+                                       const bishfpm_options_t *o) {
+  return create_options(c, NULL, o);
+}
+bishfpm_t *bishfpm_create_pairs_with_options(const bishfpm_config_t *c,
+                                             const bishfpm_pair_options_t *p,
+                                             const bishfpm_options_t *o) {
+  return p ? create_options(c, p, o) : NULL;
 }
 
 /* free single group resources */
@@ -327,7 +389,8 @@ static void free_group_resources(bishfpm_group_t *grp) {
   if (!grp || !grp->group_key) {
     return;
   }
-  free(grp->group_key);
+  bool numeric = grp->pairs != NULL;
+  memory_free(grp->budget, grp->group_key, strlen(grp->group_key) + 1);
   if (grp->item_rates) {
     bishfpm_rate_table_free(grp->item_rates);
   }
@@ -339,9 +402,13 @@ static void free_group_resources(bishfpm_group_t *grp) {
     bishfpm_arena_free(grp->arena);
   }
   if (grp->cooldowns) {
-    free(grp->cooldowns);
+    memory_free(grp->budget, grp->cooldowns,
+                grp->cooldown_cap *
+                    (cooldown_entry_size(numeric) + 2 * sizeof(uint32_t)));
   }
-  free(grp->cooldown_spare);
+  memory_free(grp->budget, grp->cooldown_spare,
+              grp->cooldown_spare_cap *
+                  (cooldown_entry_size(numeric) + 2 * sizeof(uint32_t)));
   memset(grp, 0, sizeof(bishfpm_group_t));
 }
 
@@ -350,24 +417,31 @@ void bishfpm_free(bishfpm_t *engine) {
   if (!engine || engine->busy) {
     return;
   }
+  bishfpm_memory_budget_t *budget = engine_budget(engine);
   if (engine->groups) {
     for (size_t i = 0; i < engine->group_cap; i++) {
       if (engine->groups[i].group_key) {
         free_group_resources(&engine->groups[i]);
       }
     }
-    free(engine->groups);
+    memory_free(budget, engine->groups,
+                engine->group_cap * sizeof(*engine->groups));
   }
-  free(engine->workspace.items);
-  free(engine->workspace.keys);
-  free(engine->workspace.lengths);
-  free(engine->workspace.ids);
-  free(engine);
+  memory_free(budget, engine->workspace.items,
+              engine->cfg.max_event_items * sizeof(prepared_item_t));
+  memory_free(budget, engine->workspace.keys,
+              engine->cfg.max_event_items * sizeof(const char *));
+  memory_free(budget, engine->workspace.lengths,
+              engine->cfg.max_event_items * sizeof(size_t));
+  memory_free(budget, engine->workspace.ids,
+              engine->cfg.max_event_items * sizeof(uint32_t));
+  memory_free(budget, engine, sizeof(*engine));
 }
 
 /* resize group hash table */
 static bool resize_groups(bishfpm_t *engine, size_t new_cap) {
-  bishfpm_group_t *new_groups = calloc(new_cap, sizeof(bishfpm_group_t));
+  bishfpm_group_t *new_groups =
+      memory_calloc(engine_budget(engine), new_cap, sizeof(bishfpm_group_t));
   if (!new_groups) {
     return false;
   }
@@ -384,7 +458,8 @@ static bool resize_groups(bishfpm_t *engine, size_t new_cap) {
     new_groups[idx] = engine->groups[i];
   }
 
-  free(engine->groups);
+  memory_free(engine_budget(engine), engine->groups,
+              engine->group_cap * sizeof(*engine->groups));
   engine->groups = new_groups;
   engine->group_cap = new_cap;
   return true;
@@ -436,7 +511,8 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
 
   /* initialize new group */
   bishfpm_group_t *grp = &engine->groups[idx];
-  grp->group_key = strdup(group_key);
+  grp->budget = engine_budget(engine);
+  grp->group_key = memory_strdup(grp->budget, group_key);
   if (!grp->group_key) {
     return NULL;
   }
@@ -445,22 +521,22 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
 
   if (!engine->numeric_pairs) {
     topk_layout_t layout;
-    if (!topk_layout(engine->cfg.topk_k, engine->cfg.ewma_half_life_ms,
-                     &layout)) {
+    if (!topk_layout_configured(engine->cfg.topk_k,
+                                engine->cfg.ewma_half_life_ms,
+                                engine->options.sketch_width, &layout)) {
       free_group_resources(grp);
       return NULL;
     }
-    grp->arena = bishfpm_arena_new(layout.arena_bytes);
+    grp->arena = arena_new_budget(layout.arena_bytes, grp->budget);
     if (!grp->arena) {
-      free(grp->group_key);
-      grp->group_key = NULL;
+      free_group_resources(grp);
       return NULL;
     }
   }
   /* allocate item rate table */
-  grp->item_rates = bishfpm_rate_table_new_configured(
-      INITIAL_MARGINAL_CAPACITY, engine->cfg.max_items_per_group,
-      engine->cfg.hash_seed);
+  grp->item_rates = rate_table_new_budget(INITIAL_MARGINAL_CAPACITY,
+                                          engine->cfg.max_items_per_group,
+                                          engine->cfg.hash_seed, grp->budget);
   if (!grp->item_rates) {
     free_group_resources(grp);
     return NULL;
@@ -468,16 +544,22 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
 
   if (engine->numeric_pairs) {
     bishfpm_pair_options_t *o = &engine->pair_options;
-    grp->pairs = compact_new(o->capacity, engine->cfg.ewma_half_life_ms,
-                             o->sketch_width, o->store, o->forget_below);
+    grp->pairs = compact_new_budget(o->capacity, engine->cfg.ewma_half_life_ms,
+                                    o->sketch_width, o->store, o->forget_below,
+                                    grp->budget);
     if (!grp->pairs) {
       free_group_resources(grp);
       return NULL;
     }
   } else {
     /* allocate top-k using group arena */
-    grp->topk = bishfpm_topk_new_arena(grp->arena, engine->cfg.topk_k,
-                                       engine->cfg.ewma_half_life_ms);
+    grp->topk = engine->options.store == BISHFPM_STORE_FSS
+                    ? bishfpm_topk_new_fss_arena(grp->arena, engine->cfg.topk_k,
+                                                 engine->cfg.ewma_half_life_ms,
+                                                 engine->options.sketch_width,
+                                                 engine->cfg.hash_seed)
+                    : bishfpm_topk_new_arena(grp->arena, engine->cfg.topk_k,
+                                             engine->cfg.ewma_half_life_ms);
     if (!grp->topk) {
       free_group_resources(grp);
       return NULL;
@@ -485,9 +567,9 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
     bishfpm_topk_set_seed(grp->topk, engine->cfg.hash_seed);
   }
   grp->cooldown_cap = next_pow2(engine->cfg.topk_k * 2);
-  grp->cooldowns =
-      calloc(grp->cooldown_cap,
-             cooldown_entry_size(grp->pairs != NULL) + 2 * sizeof(uint32_t));
+  grp->cooldowns = memory_calloc(grp->budget, grp->cooldown_cap,
+                                 cooldown_entry_size(grp->pairs != NULL) +
+                                     2 * sizeof(uint32_t));
   if (!grp->cooldowns) {
     free_group_resources(grp);
     return NULL;
@@ -561,10 +643,11 @@ static size_t cooldown_maintain(bishfpm_group_t *grp, size_t capacity,
   }
   size_t bytes_per_entry = stride + 2 * sizeof(uint32_t);
   if (grp->cooldown_spare_cap != capacity) {
-    free(grp->cooldown_spare);
+    memory_free(grp->budget, grp->cooldown_spare,
+                grp->cooldown_spare_cap * bytes_per_entry);
     grp->cooldown_spare = NULL;
     grp->cooldown_spare_cap = 0;
-    grp->cooldown_spare = calloc(capacity, bytes_per_entry);
+    grp->cooldown_spare = memory_calloc(grp->budget, capacity, bytes_per_entry);
     if (!grp->cooldown_spare)
       return grp->cooldown_count;
     grp->cooldown_spare_cap = capacity;
@@ -862,7 +945,7 @@ static bool candidate_promoted(bishfpm_eval_ctx_t *ctx, size_t order,
   if (update.replaced)
     ctx->engine->stats.pattern_replacements++;
   ctx->engine->stats.candidates_evaluated++;
-  if ((ctx->grp->pairs && !update.present) ||
+  if (((ctx->grp->pairs || ctx->grp->topk->sketch_width) && !update.present) ||
       order < ctx->engine->cfg.min_itemset_order ||
       !(update.lower >= ctx->engine->cfg.min_pattern_rate))
     return false;
@@ -954,6 +1037,19 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
     pattern[length] = 0;
     topk_result_t update = topk_add_sized(ctx->grp->topk, pattern, length,
                                           ctx->weight, ctx->timestamp_ms);
+    bishfpm_pattern_pressure_t *p = &ctx->grp->pressure;
+    p->candidates_evaluated++;
+    if (ctx->weight == 0)
+      p->zero_weight_queries++;
+    else if (!update.accepted)
+      p->rejected_updates++;
+    else if (update.was_present)
+      p->resident_updates++;
+    else if (update.present)
+      p->admissions++;
+    else
+      p->filtered_updates++;
+    p->replacements += update.replaced;
     if (candidate_promoted(ctx, depth, update))
       notify_candidate(ctx, items, depth, update, pattern, 0, update.hash,
                        NULL);
@@ -1074,6 +1170,7 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     return 0;
   }
   engine->busy = true;
+  uint64_t memory_denials = engine->memory.denials;
   bool budget_rejection = false;
   rejection_reason_t reason = REJECT_INVALID;
   int result = -1;
@@ -1197,6 +1294,10 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
   }
 finalize:
   if (result < 0) {
+    if (engine_budget(engine) && engine->memory.denials != memory_denials) {
+      budget_rejection = true;
+      engine->memory.event_rejections++;
+    }
     engine->rejected[reason]++;
     engine->stats.events_rejected++;
     if (budget_rejection)
@@ -1289,9 +1390,10 @@ int bishfpm_pattern_bounds(bishfpm_t *engine, const char *name,
   out->lower = r.lower;
   out->upper = r.upper;
   out->resident = r.present;
-  out->known =
-      r.present || (g->pairs && (g->pairs->kind == BISHFPM_PAIR_THRESHOLD ||
-                                 g->pairs->kind == BISHFPM_PAIR_FSS));
+  out->known = r.present ||
+               (g->pairs && (g->pairs->kind == BISHFPM_PAIR_THRESHOLD ||
+                             g->pairs->kind == BISHFPM_PAIR_FSS)) ||
+               (g->topk && g->topk->sketch_width != 0);
   return 1;
 }
 void bishfpm_get_pair_stats(const bishfpm_t *engine,
@@ -1391,6 +1493,46 @@ static void prune_group(bishfpm_t *engine, bishfpm_group_t *group,
                       engine->cfg.trigger_cooldown_ms, true);
 }
 
+/* Budget exhaustion must not prevent group retirement. A denied compaction
+ * can keep the old capacity while releasing weak groups and repairing probes.
+ */
+static size_t prune_groups_in_place(bishfpm_t *engine, uint64_t now,
+                                    double cutoff) {
+  size_t removed = 0, mask = engine->group_cap - 1;
+  for (size_t i = 0; i < engine->group_cap;) {
+    bishfpm_group_t *group = &engine->groups[i];
+    if (!group->group_key) {
+      i++;
+      continue;
+    }
+    double rate = bishfpm_rate_query(&group->group_rate,
+                                     effective_time(now, group->max_time_ms),
+                                     engine->cfg.ewma_half_life_ms);
+    if (rate >= cutoff) {
+      prune_group(engine, group, now, cutoff, rate);
+      i++;
+      continue;
+    }
+    engine->stats.items_pruned += group->item_rates->count;
+    engine->stats.groups_pruned++;
+    pressure_add(&engine->pressure, &group->pressure);
+    free_group_resources(group);
+    engine->group_count--;
+    removed++;
+    size_t hole = i;
+    for (size_t probe = (i + 1) & mask; engine->groups[probe].group_key;
+         probe = (probe + 1) & mask) {
+      size_t home = engine->groups[probe].hash & mask;
+      if (((probe - home) & mask) >= ((probe - hole) & mask)) {
+        engine->groups[hole] = engine->groups[probe];
+        hole = probe;
+      }
+    }
+    memset(&engine->groups[hole], 0, sizeof(engine->groups[hole]));
+  }
+  return removed;
+}
+
 /* prune inactive groups and items */
 size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
   if (!engine || engine->group_count == 0 || !isfinite(min_rate) ||
@@ -1436,10 +1578,14 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
     engine->busy = false;
     return 0;
   }
-  bishfpm_group_t *new_groups = calloc(new_cap, sizeof(bishfpm_group_t));
+  bishfpm_group_t *new_groups =
+      memory_calloc(engine_budget(engine), new_cap, sizeof(bishfpm_group_t));
   if (!new_groups) {
+    size_t removed = engine_budget(engine)
+                         ? prune_groups_in_place(engine, now_ms, min_rate)
+                         : 0;
     engine->busy = false;
-    return 0;
+    return removed;
   }
 
   size_t mask = new_cap - 1;
@@ -1455,6 +1601,7 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
       if (engine->groups[i].item_rates) {
         engine->stats.items_pruned += engine->groups[i].item_rates->count;
       }
+      pressure_add(&engine->pressure, &engine->groups[i].pressure);
       free_group_resources(&engine->groups[i]);
       engine->stats.groups_pruned++;
     } else {
@@ -1467,13 +1614,73 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
     }
   }
 
-  free(engine->groups);
+  memory_free(engine_budget(engine), engine->groups,
+              engine->group_cap * sizeof(*engine->groups));
   engine->groups = new_groups;
   engine->group_cap = new_cap;
   engine->group_count = survivors;
   engine->busy = false;
 
   return pruned;
+}
+
+int bishfpm_get_pattern_pressure(const bishfpm_t *engine, const char *name,
+                                 bishfpm_pattern_pressure_t *out) {
+  if (!engine || !out || engine->numeric_pairs)
+    return 0;
+  bishfpm_pattern_pressure_t result = engine->pressure;
+  result.resident_patterns = result.resident_capacity = 0;
+  if (name) {
+    const bishfpm_group_t *group = find_group(engine, name, NULL);
+    if (!group)
+      return 0;
+    result = group->pressure;
+    result.resident_patterns = bishfpm_topk_count(group->topk);
+    result.resident_capacity = engine->cfg.topk_k;
+  } else {
+    for (size_t i = 0; i < engine->group_cap; i++) {
+      if (!engine->groups[i].group_key)
+        continue;
+      pressure_add(&result, &engine->groups[i].pressure);
+      result.resident_patterns += bishfpm_topk_count(engine->groups[i].topk);
+      result.resident_capacity += engine->cfg.topk_k;
+    }
+  }
+  *out = result;
+  return 1;
+}
+
+int bishfpm_get_vocabulary_stats(const bishfpm_t *engine, const char *name,
+                                 bishfpm_vocabulary_stats_t *out) {
+  if (!engine || !name || !out)
+    return 0;
+  const bishfpm_group_t *g = find_group(engine, name, NULL);
+  if (!g)
+    return 0;
+  *out = (bishfpm_vocabulary_stats_t){
+      g->item_rates->count, engine->cfg.max_items_per_group,
+      engine->cfg.max_items_per_group - g->item_rates->count,
+      engine->numeric_pairs};
+  return 1;
+}
+
+void bishfpm_get_memory_stats(const bishfpm_t *engine,
+                              bishfpm_memory_stats_t *out) {
+  if (!engine || !out)
+    return;
+  *out = (bishfpm_memory_stats_t){0};
+  out->mode = engine->options.memory_mode;
+  out->limit_bytes = engine->cfg.max_memory_bytes;
+  if (out->mode == BISHFPM_MEMORY_DYNAMIC) {
+    out->current_bytes = engine->memory.current;
+    out->peak_bytes = engine->memory.peak;
+    out->allocation_denials = engine->memory.denials;
+    out->event_rejections = engine->memory.event_rejections;
+  } else {
+    bishfpm_stats_t stats;
+    bishfpm_get_stats(engine, &stats);
+    out->current_bytes = stats.memory_current_bytes;
+  }
 }
 
 /* query engine statistics */

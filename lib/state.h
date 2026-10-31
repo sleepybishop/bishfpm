@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef struct bishfpm_memory_budget bishfpm_memory_budget_t;
+
 /* continuous time-decayed EWMA rate */
 struct bishfpm_rate {
   double rate;
@@ -31,7 +33,13 @@ struct bishfpm_rate_table {
   size_t key_bytes; /* Owned key payload, including terminating NUL bytes. */
   size_t max_items;
   uint64_t hash_seed;
+  bishfpm_memory_budget_t *budget;
 };
+
+typedef struct {
+  double count;
+  uint64_t time_ms;
+} bishfpm_sketch_cell_t;
 
 /* top-k min-heap item */
 typedef struct {
@@ -66,6 +74,10 @@ struct bishfpm_topk {
   uint64_t max_time_ms;
   double omitted_bound; /* upper bound for pruned history at max_time_ms */
   bool arena_backed;
+  bishfpm_sketch_cell_t *sketch;
+  uint32_t sketch_width;
+  double sketch_total;
+  bool history_started;
 };
 
 /* bump allocator arena */
@@ -74,6 +86,7 @@ struct bishfpm_arena {
   uint8_t *end;
   uint8_t *base;
   bool owned;
+  bishfpm_memory_budget_t *budget;
 };
 
 #endif

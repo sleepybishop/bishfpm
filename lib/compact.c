@@ -201,25 +201,31 @@ size_t compact_bytes(uint32_t k, uint32_t width, bishfpm_pair_store_t kind) {
 }
 compact_t *compact_new(uint32_t k, double half, uint32_t width,
                        bishfpm_pair_store_t kind, double floor) {
+  return compact_new_budget(k, half, width, kind, floor, NULL);
+}
+compact_t *compact_new_budget(uint32_t k, double half, uint32_t width,
+                              bishfpm_pair_store_t kind, double floor,
+                              bishfpm_memory_budget_t *budget) {
   if (!compact_bytes(k, width, kind))
     return NULL;
-  compact_t *t = calloc(1, sizeof(*t));
+  compact_t *t = memory_calloc(budget, 1, sizeof(*t));
   if (!t)
     return NULL;
+  t->budget = budget;
   t->k = k;
   t->half_life_ms = half;
   t->sketch_width = width;
   t->kind = kind;
   t->forget_below = floor;
   t->slot_map_cap = next_pow2((size_t)k * 2);
-  t->heap = calloc(k, sizeof(*t->heap));
+  t->heap = memory_calloc(budget, k, sizeof(*t->heap));
   if (!t->heap) {
     compact_free(t);
     return NULL;
   }
-  t->slot_map = calloc(t->slot_map_cap, sizeof(*t->slot_map));
+  t->slot_map = memory_calloc(budget, t->slot_map_cap, sizeof(*t->slot_map));
   if (width)
-    t->sketch = calloc((size_t)width, sizeof(*t->sketch));
+    t->sketch = memory_calloc(budget, (size_t)width, sizeof(*t->sketch));
   if (!t->slot_map || (width && !t->sketch)) {
     compact_free(t);
     return NULL;
@@ -228,10 +234,10 @@ compact_t *compact_new(uint32_t k, double half, uint32_t width,
 }
 void compact_free(compact_t *t) {
   if (t) {
-    free(t->heap);
-    free(t->slot_map);
-    free(t->sketch);
-    free(t);
+    memory_free(t->budget, t->heap, t->k * sizeof(*t->heap));
+    memory_free(t->budget, t->slot_map, t->slot_map_cap * sizeof(*t->slot_map));
+    memory_free(t->budget, t->sketch, t->sketch_width * sizeof(*t->sketch));
+    memory_free(t->budget, t, sizeof(*t));
   }
 }
 

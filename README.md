@@ -90,9 +90,13 @@ pattern history. Input and candidate limits reject oversized events whole.
 When `min_pattern_rate` is positive, `item_rate_threshold` must not exceed it;
 for example, lowering `min_pattern_rate` to 1 also requires lowering the default
 item threshold to 1 or less. Constructors return `NULL` for invalid settings,
-a conservative memory bound above `max_memory_bytes`, or allocation failure.
-See the [configuration fields](include/bishfpm.h) and
-[resource limits](docs/DESIGN.md#resource-limits-and-complexity) for details.
+an initial payload requirement above `max_memory_bytes`, or allocation failure.
+The default conservative memory mode also requires the configured worst-case
+payload bound to fit that budget. Opt-in dynamic mode checks allocations as the
+engine grows instead; required reservation denial rejects an event before counts
+change.
+See the configuration fields in `bishfpm.h` and
+resource limits in `docs/DESIGN.md` for details.
 
 ## Choosing a store
 
@@ -112,6 +116,7 @@ flowchart TD
     A --> P["Pairs only<br/>Numeric item IDs"]
 
     G --> SS["Space-Saving<br/>Default store"]
+    G --> GFSS["Filtered Space-Saving<br/>Experimental<br/>Bucket history filters admission"]
 
     P --> NSS["Numeric Space-Saving<br/>Recommended baseline"]
     P --> TH["Threshold<br/>Count intervals<br/>Rejects events when saturated"]
@@ -123,10 +128,16 @@ flowchart TD
 | Store | Use it for |
 | --- | --- |
 | `bishfpm_create` | General combinations, including higher-order itemsets |
+| `BISHFPM_STORE_FSS` via `bishfpm_create_with_options` | Experimental filtering for general combinations, including higher-order itemsets |
 | `BISHFPM_PAIR_SS` | Pair-only streaming; the recommended starting point |
 | `BISHFPM_PAIR_THRESHOLD` | Explicit forgetting bounds and rejection when capacity is exhausted |
 | `BISHFPM_PAIR_FSS` | Experimental filtering under candidate pressure |
 | `bishfpm_pair_counter_new` | Exact counts over a fixed vocabulary, without decay or alerts |
+
+General stores use `topk_k` for resident pattern capacity. With
+`bishfpm_create_with_options`, select `BISHFPM_STORE_SS` with zero `sketch_width`
+or `BISHFPM_STORE_FSS` with `sketch_width` from 1 through `2^24`. See
+Experimental general-store FSS and memory options below for an example.
 
 Numeric stores use `bishfpm_create_pairs` with both itemset orders set to 2.
 Their pair capacity is separate from `topk_k`, which sizes cooldown storage.
@@ -177,7 +188,7 @@ reuses the normal object and archive paths, so clean and rebuild afterward as
 shown above before using normal build targets.
 
 `examples/stream_tsv` reads timestamp (seconds), group, and 1–32 item columns.
-Sample streams are in [data/](data/).
+Sample streams are in `data/`.
 
 ## Validation
 
@@ -201,14 +212,96 @@ do not establish fraud or anomaly detection accuracy.
 
 ## Further reading
 
-- [API and operating contract](docs/DESIGN.md): time, counts, callbacks, and limits.
-- [Algorithm lineage](docs/PRIOR_ART.md): inherited techniques and comparison scope.
-- [Standalone APIs](include/bishfpm_lowlevel.h): counters, stores, rates, and arenas.
+- `docs/DESIGN.md`: time, counts, callbacks, and limits.
+- `docs/PRIOR_ART.md`: inherited techniques and comparison scope.
+- `bishfpm_lowlevel.h`: counters, stores, rates, and arenas.
 
-MIT licensed; see [LICENSE](LICENSE).
+MIT licensed; see `LICENSE`.
 
 ## References
 
 1. Seeja, K. R., and Zareapoor, M. (2014). “[FraudMiner: A Novel Credit Card Fraud Detection Model Based on Frequent Itemset Mining](https://pmc.ncbi.nlm.nih.gov/articles/PMC4180893/).” *The Scientific World Journal*.
 2. “[Automating Root-Cause Analysis of Network Anomalies using Frequent Itemset Mining](https://conferences.sigcomm.org/sigcomm/2010/papers/sigcomm/p467.pdf).” *ACM SIGCOMM*, 2010.
 3. Yoachimik, O. (2025). “[Defending the Internet: how Cloudflare blocked a monumental 7.3 Tbps DDoS attack](https://blog.cloudflare.com/defending-the-internet-how-cloudflare-blocked-a-monumental-7-3-tbps-ddos/).” *Cloudflare Blog*.
+
+## Experimental general-store FSS and memory options
+
+Existing constructors keep Space-Saving and conservative memory sizing. The new
+options API can select general-itemset FSS, dynamic memory budgeting, or both:
+
+```c
+bishfpm_config_t cfg;
+bishfpm_config_default(&cfg);
+cfg.max_groups = 1000;
+cfg.max_memory_bytes = 64U << 20;
+
+bishfpm_options_t options;
+bishfpm_options_default(&options);
+options.store = BISHFPM_STORE_FSS;
+options.sketch_width = 256;
+options.memory_mode = BISHFPM_MEMORY_DYNAMIC;
+bishfpm_t *engine = bishfpm_create_with_options(&cfg, &options);
+/* Check engine for NULL, then ingest events as usual. */
+```
+
+FSS can filter nonresident candidates without copying their strings or replacing
+heap entries. It adds sketch memory and changes retention; it is experimental,
+and improved recall is workload-dependent. Its absent-pattern queries return
+certified bucket bounds. As with numeric FSS, bounds cover evaluated candidates;
+disable both marginal gates for full transaction history. Filtered misses do not
+emit alerts. Standalone stores support `bishfpm_topk_new_fss` and
+`bishfpm_topk_new_fss_arena`, with matching ownership rules. FSS seeds are fixed
+after positive input: `bishfpm_topk_try_set_seed` reports refusal, while the legacy
+setter leaves the store unchanged. Reset starts a new history epoch and permits
+reseeding.
+
+Dynamic mode charges every engine-owned allocation against `max_memory_bytes`,
+including key copies, staging, old/new tables, store arenas, sketches, and cooldown
+spares. This allows sparse groups to share a budget without reserving their full
+configured growth potential. Required reservation denial returns `-1` before count
+or watermark changes. Cooldown growth/maintenance is optional after acceptance;
+its denial preserves active protection and can suppress new alerts. Dynamic
+pruning can release weak groups and marginal keys without allocating replacement
+tables, so reclamation remains possible at the cap. The cap is
+requested payload, excluding allocator overhead, caller buffers, standalone
+stores, and allocations made by callbacks.
+
+`bishfpm_get_memory_stats` reports dynamic current/peak payload, allocation denials,
+and events rejected by the cap. `bishfpm_get_stats().memory_bound_bytes` is the
+configured cap in dynamic mode. A memory-denied event also increments the existing
+`allocation_failure` reason and `budget_rejections`; OS allocation failures do not
+increment the budget-denial counters. Conservative mode retains its existing
+static bound and reports zero for untracked peak/denial fields.
+
+`bishfpm_get_vocabulary_stats(engine, group, &snapshot)` reports retained items,
+item limit, remaining slots, and whether identities persist until group removal.
+Dormant numeric identities still occupy slots. The query is read-only and does
+not recycle IDs. Numeric engines can opt into dynamic budgeting with
+`bishfpm_create_pairs_with_options`; their store is still selected by pair options,
+so the engine options must use `BISHFPM_STORE_SS` and zero sketch width.
+
+Run `make t/00util/bench_general` followed by
+`./t/00util/bench_general 3000 42` for a reproducible SS/FSS comparison. CSV output
+includes capacities and sketch width, the shared store budget, actual store
+bytes, total engine current/peak payload, throughput, replacements, alert recall,
+and persistent/burst detection delays. Delay `-1` means no alert was observed.
+The FSS resident capacity is reduced to pay for its sketch and alignment within
+the SS budget, and its total peak payload is checked against SS. Both stores see
+the same weighted/late events, shifting vocabulary, persistent pair, and triple
+burst. An independent long-double oracle checks reported intervals and callback
+support. Timing includes callback validation but excludes the oracle sweep.
+These are diagnostic workloads, not performance or recall guarantees.
+
+### Store sizing and pattern pressure
+
+General pattern capacity (`topk_k`) bounds the resident working set per group.
+Because transactions generate combinations combinatorially ($O(k^2)$ pairs,
+$O(k^3)$ triples), size `topk_k` against active candidate pattern volume rather
+than raw item counts. Undersized stores suffer replacement churn that evicts
+emerging patterns before they accumulate sufficient support to alert, degrading
+recall; increasing `max_memory_bytes` raises only the memory budget, not `topk_k`.
+
+To monitor capacity health under load, call `bishfpm_get_pattern_pressure(engine, group, &out)`
+(pass `NULL` for engine-wide totals). A high replacement rate relative to resident
+updates indicates store pressure. Workload capacity sweeps across stable, burst,
+and churn streams can be benchmarked with `./t/00util/bench_general --sweep 3000 42`.

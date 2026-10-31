@@ -109,18 +109,28 @@ size_t bishfpm_rate_table_count(const bishfpm_rate_table_t *tbl) {
 bishfpm_rate_table_t *bishfpm_rate_table_new_configured(size_t initial_cap,
                                                         size_t max_items,
                                                         uint64_t hash_seed) {
+  return rate_table_new_budget(initial_cap, max_items, hash_seed, NULL);
+}
+
+bishfpm_rate_table_t *rate_table_new_budget(size_t initial_cap,
+                                            size_t max_items,
+                                            uint64_t hash_seed,
+                                            bishfpm_memory_budget_t *budget) {
   size_t cap = next_pow2(initial_cap < 16 ? 16 : initial_cap);
   if (cap == 0 || cap > SIZE_MAX / sizeof(bishfpm_rate_entry_t)) {
     return NULL;
   }
-  bishfpm_rate_table_t *tbl = calloc(1, sizeof(bishfpm_rate_table_t));
+  bishfpm_rate_table_t *tbl =
+      memory_calloc(budget, 1, sizeof(bishfpm_rate_table_t));
   if (!tbl) {
     return NULL;
   }
+  tbl->budget = budget;
   tbl->capacity = cap;
-  tbl->entries = calloc(tbl->capacity, sizeof(bishfpm_rate_entry_t));
+  tbl->entries =
+      memory_calloc(budget, tbl->capacity, sizeof(bishfpm_rate_entry_t));
   if (!tbl->entries) {
-    free(tbl);
+    memory_free(budget, tbl, sizeof(*tbl));
     return NULL;
   }
   tbl->count = 0;
@@ -137,12 +147,14 @@ void bishfpm_rate_table_free(bishfpm_rate_table_t *tbl) {
   if (tbl->entries) {
     for (size_t i = 0; i < tbl->capacity; i++) {
       if (tbl->entries[i].key) {
-        free(tbl->entries[i].key);
+        memory_free(tbl->budget, tbl->entries[i].key,
+                    strlen(tbl->entries[i].key) + 1);
       }
     }
-    free(tbl->entries);
+    memory_free(tbl->budget, tbl->entries,
+                tbl->capacity * sizeof(*tbl->entries));
   }
-  free(tbl);
+  memory_free(tbl->budget, tbl, sizeof(*tbl));
 }
 
 /* Return either the matching entry or its insertion slot. */
@@ -201,6 +213,46 @@ double bishfpm_rate_table_query(const bishfpm_rate_table_t *tbl,
   return entry ? bishfpm_rate_query(&entry->rate, now_ms, half_life_ms) : 0;
 }
 
+/* Dynamic mode must be able to release weak keys even when a replacement
+ * table cannot fit. Keep capacity and repair probe chains without allocation.
+ */
+static size_t prune_in_place(bishfpm_rate_table_t *tbl, uint64_t now,
+                             double half, double cutoff) {
+  size_t removed = 0, mask = tbl->capacity - 1;
+  for (size_t i = 0; i < tbl->capacity;) {
+    bishfpm_rate_entry_t *entry = &tbl->entries[i];
+    if (!entry->key) {
+      i++;
+      continue;
+    }
+    double rate = bishfpm_rate_query(&entry->rate, now, half);
+    if (rate >= cutoff) {
+      if (now >= entry->rate.last_time_ms) {
+        entry->rate.rate = rate;
+        entry->rate.last_time_ms = now;
+      }
+      i++;
+      continue;
+    }
+    size_t bytes = strlen(entry->key) + 1;
+    memory_free(tbl->budget, entry->key, bytes);
+    tbl->key_bytes -= bytes;
+    tbl->count--;
+    removed++;
+    size_t hole = i;
+    for (size_t probe = (i + 1) & mask; tbl->entries[probe].key;
+         probe = (probe + 1) & mask) {
+      size_t home = tbl->entries[probe].hash & mask;
+      if (((probe - home) & mask) >= ((probe - hole) & mask)) {
+        tbl->entries[hole] = tbl->entries[probe];
+        hole = probe;
+      }
+    }
+    memset(&tbl->entries[hole], 0, sizeof(tbl->entries[hole]));
+  }
+  return removed;
+}
+
 /* prune entries with decayed rate below min_rate */
 size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
                                 double half_life_ms, double min_rate) {
@@ -238,9 +290,10 @@ size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
     return 0;
   }
   bishfpm_rate_entry_t *new_entries =
-      calloc(new_cap, sizeof(bishfpm_rate_entry_t));
+      memory_calloc(tbl->budget, new_cap, sizeof(bishfpm_rate_entry_t));
   if (!new_entries) {
-    return 0;
+    return tbl->budget ? prune_in_place(tbl, now_ms, half_life_ms, min_rate)
+                       : 0;
   }
 
   size_t mask = new_cap - 1;
@@ -254,7 +307,8 @@ size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
         bishfpm_rate_query(&tbl->entries[i].rate, now_ms, half_life_ms);
     if (current < min_rate) {
       tbl->key_bytes -= strlen(tbl->entries[i].key) + 1;
-      free(tbl->entries[i].key);
+      memory_free(tbl->budget, tbl->entries[i].key,
+                  strlen(tbl->entries[i].key) + 1);
       tbl->entries[i].key = NULL;
     } else {
       /* update decayed rate only if event timestamp is not later */
@@ -273,7 +327,7 @@ size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
     }
   }
 
-  free(tbl->entries);
+  memory_free(tbl->budget, tbl->entries, tbl->capacity * sizeof(*tbl->entries));
   tbl->entries = new_entries;
   tbl->capacity = new_cap;
   tbl->count = new_count;
@@ -310,7 +364,8 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
   }
   if (capacity > SIZE_MAX / sizeof(*tbl->entries))
     return RATE_ALLOCATION;
-  bishfpm_rate_entry_t *staged = calloc(missing, sizeof(*staged));
+  bishfpm_rate_entry_t *staged =
+      memory_calloc(tbl->budget, missing, sizeof(*staged));
   if (!staged)
     return RATE_ALLOCATION;
   size_t n = 0, key_bytes = 0;
@@ -318,7 +373,7 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
     uint64_t hash = bishfpm_hash_str(keys[i], tbl->hash_seed);
     if (rate_table_find(tbl, keys[i], hash))
       continue;
-    char *copy = strdup(keys[i]);
+    char *copy = memory_strdup(tbl->budget, keys[i]);
     if (!copy)
       goto fail;
     key_bytes += strlen(copy) + 1;
@@ -329,7 +384,7 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
 
   bishfpm_rate_entry_t *entries = tbl->entries;
   if (capacity != tbl->capacity) {
-    entries = calloc(capacity, sizeof(*entries));
+    entries = memory_calloc(tbl->budget, capacity, sizeof(*entries));
     if (!entries)
       goto fail;
     for (size_t i = 0; i < tbl->capacity; i++) {
@@ -342,17 +397,18 @@ rate_prepare_result_t rate_table_prepare_result(bishfpm_rate_table_t *tbl,
   for (size_t i = 0; i < n; i++)
     *rate_slot(entries, capacity, staged[i].key, staged[i].hash) = staged[i];
   if (entries != tbl->entries)
-    free(tbl->entries);
+    memory_free(tbl->budget, tbl->entries,
+                tbl->capacity * sizeof(*tbl->entries));
   tbl->entries = entries;
   tbl->capacity = capacity;
   tbl->count = total;
   tbl->key_bytes += key_bytes;
-  free(staged);
+  memory_free(tbl->budget, staged, missing * sizeof(*staged));
   return RATE_PREPARED;
 fail:
   for (size_t i = 0; i < n; i++)
-    free(staged[i].key);
-  free(staged);
+    memory_free(tbl->budget, staged[i].key, strlen(staged[i].key) + 1);
+  memory_free(tbl->budget, staged, missing * sizeof(*staged));
   return RATE_ALLOCATION;
 }
 

@@ -50,6 +50,31 @@ int main(void) {
       !bounds.known || bounds.resident || bounds.upper < 1 ||
       bishfpm_pattern_rate(engine, "g", "a\x1f" "c", 0) != bounds.upper) return 10;
   bishfpm_free(engine);
+  bishfpm_options_t general;
+  bishfpm_options_default(&general);
+  general.store = BISHFPM_STORE_FSS;
+  general.sketch_width = 17;
+  general.memory_mode = BISHFPM_MEMORY_DYNAMIC;
+  cfg.topk_k = 8;
+  cfg.max_groups = 1000;
+  cfg.max_items_per_group = 16;
+  cfg.max_event_items = 16;
+  cfg.max_memory_bytes = 256U << 10;
+  engine = bishfpm_create_with_options(&cfg, &general);
+  if (!engine) return 11;
+  if (bishfpm_add_event(engine, "g", 0, items, 2, NULL, NULL) < 0) return 12;
+  bishfpm_vocabulary_stats_t vocabulary;
+  if (!bishfpm_get_vocabulary_stats(engine, "g", &vocabulary) ||
+      vocabulary.retained_items != 2 || vocabulary.remaining_items != 14) return 13;
+  bishfpm_memory_stats_t memory;
+  bishfpm_pattern_pressure_t pressure;
+  if (!bishfpm_get_pattern_pressure(engine, "g", &pressure) ||
+      pressure.candidates_evaluated != 1 || pressure.admissions != 1 ||
+      pressure.resident_patterns != 1 || pressure.resident_capacity != 8) return 16;
+  bishfpm_get_memory_stats(engine, &memory);
+  if (memory.current_bytes > memory.peak_bytes || memory.peak_bytes > memory.limit_bytes) return 14;
+  if (!bishfpm_pattern_bounds(engine, "g", "a\037b", 0, &bounds) || !bounds.known) return 15;
+  bishfpm_free(engine);
   return rejected != -1 || reasons.invalid_input != 1 || result < 0 ||
          bishfpm_prune_pairs(NULL, "g", 0, 1) != 0 ||
          strcmp(bishfpm_version(), BISHFPM_VERSION_STRING) ||
@@ -96,7 +121,7 @@ test ! -e "$stage/usr/include/internal.h"
 test ! -e "$stage/usr/include/state.h"
 if nm -D --defined-only "$stage/usr/lib/libbishfpm.so" | \
     awk '{print $3}' | \
-    grep -Eq '^(topk_add_result|topk_query_result|rate_table_find|rate_table_prepare_result|bishfpm_arena_init|compact_.*)$'; then
+    grep -Eq '^(topk_add_result|topk_add_sized|topk_query_result|rate_table_find|rate_table_new_budget|rate_table_prepare_result|arena_new_budget|bishfpm_arena_init|compact_.*)$'; then
   printf 'Private helper exported from shared library\n' >&2
   exit 1
 fi

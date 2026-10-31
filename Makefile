@@ -31,12 +31,16 @@ TEST_UTILS = \
 	t/00util/test_pairs \
 	t/00util/test_online \
 	t/00util/test_fss \
-	t/00util/test_rejections
+	t/00util/test_rejections \
+	t/00util/test_general_fss \
+	t/00util/test_dynamic \
+	t/00util/test_pressure
 
 BENCH = \
 	t/00util/bench \
 	t/00util/bench_stores \
-	t/00util/bench_cooldown
+	t/00util/bench_cooldown \
+	t/00util/bench_general
 
 EXAMPLES = \
 	examples/stream_tsv
@@ -58,6 +62,12 @@ lib/%.o: lib/%.c
 t/00util/test_rejections: t/00util/test_rejections.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -o $@
 
+t/00util/test_dynamic: t/00util/test_dynamic.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup,--wrap=free $(LDLIBS) -o $@
+
+t/00util/test_pressure: t/00util/test_pressure.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=calloc $(LDLIBS) -o $@
+
 t/00util/%: t/00util/%.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@
 
@@ -69,7 +79,7 @@ examples/%: examples/%.c libbishfpm.a
 -include $(patsubst %,%.d,$(BENCH))
 -include $(patsubst %,%.d,$(EXAMPLES))
 
-test: $(TEST_UTILS) $(EXAMPLES)
+test: $(TEST_UTILS) $(EXAMPLES) t/00util/bench_general
 	prove -I. -v t/*.t
 
 check: test

@@ -3,40 +3,47 @@
 #include <string.h>
 
 /* Every public arena owns its wrapper; only buffer ownership varies. */
-static bishfpm_arena_t *arena_wrap(void *buffer, size_t size, bool owned) {
+static bishfpm_arena_t *arena_wrap(void *buffer, size_t size, bool owned,
+                                   bishfpm_memory_budget_t *budget) {
   if (!buffer || !size || size > PTRDIFF_MAX)
     return NULL;
-  bishfpm_arena_t *a = malloc(sizeof(*a));
+  bishfpm_arena_t *a = memory_malloc(budget, sizeof(*a));
   if (!a)
     return NULL;
   a->base = a->beg = buffer;
   a->end = a->base + size;
   a->owned = owned;
+  a->budget = budget;
   return a;
 }
 
 bishfpm_arena_t *bishfpm_arena_new(size_t size) {
+  return arena_new_budget(size, NULL);
+}
+
+bishfpm_arena_t *arena_new_budget(size_t size,
+                                  bishfpm_memory_budget_t *budget) {
   if (!size || size > PTRDIFF_MAX)
     return NULL;
-  void *buffer = malloc(size);
+  void *buffer = memory_malloc(budget, size);
   if (!buffer)
     return NULL;
-  bishfpm_arena_t *a = arena_wrap(buffer, size, true);
+  bishfpm_arena_t *a = arena_wrap(buffer, size, true, budget);
   if (!a)
-    free(buffer);
+    memory_free(budget, buffer, size);
   return a;
 }
 
 bishfpm_arena_t *bishfpm_arena_new_buffer(void *buffer, size_t size) {
-  return arena_wrap(buffer, size, false);
+  return arena_wrap(buffer, size, false, NULL);
 }
 
 void bishfpm_arena_free(bishfpm_arena_t *a) {
   if (!a)
     return;
   if (a->owned)
-    free(a->base);
-  free(a);
+    memory_free(a->budget, a->base, (size_t)(a->end - a->base));
+  memory_free(a->budget, a, sizeof(*a));
 }
 
 size_t bishfpm_arena_used(const bishfpm_arena_t *a) {

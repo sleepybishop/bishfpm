@@ -14,7 +14,8 @@ static void alert(const char *g, const bishfpm_trigger_t *t, void *ud) {
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (!size)
     return 0;
-  unsigned store = *data++ % 4;
+  unsigned selector = *data++;
+  unsigned store = selector % 5;
   size--;
   bishfpm_config_t c;
   bishfpm_config_default(&c);
@@ -28,16 +29,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   c.max_itemset_order = 3;
   c.trigger_cooldown_ms = 10;
   c.subsumption_ratio = .8;
+  bishfpm_options_t engine_options;
+  bishfpm_options_default(&engine_options);
+  if (selector & 128) {
+    engine_options.memory_mode = BISHFPM_MEMORY_DYNAMIC;
+    c.max_memory_bytes = 64U << 10;
+  }
   bishfpm_t *e;
-  if (store) {
+  if (store >= 2) {
     c.min_itemset_order = c.max_itemset_order = 2;
-    bishfpm_pair_options_t options = {
-        store == 1 ? BISHFPM_PAIR_SS :
-        store == 2 ? BISHFPM_PAIR_THRESHOLD : BISHFPM_PAIR_FSS,
-        16, store == 3 ? 64 : 0, .01};
-    e = bishfpm_create_pairs(&c, &options);
-  } else
-    e = bishfpm_create(&c);
+    bishfpm_pair_options_t options = {store == 2   ? BISHFPM_PAIR_SS
+                                      : store == 3 ? BISHFPM_PAIR_THRESHOLD
+                                                   : BISHFPM_PAIR_FSS,
+                                      16, store == 4 ? 64 : 0, .01};
+    e = bishfpm_create_pairs_with_options(&c, &options, &engine_options);
+  } else {
+    if (store == 1) {
+      engine_options.store = BISHFPM_STORE_FSS;
+      engine_options.sketch_width = 17;
+    }
+    e = bishfpm_create_with_options(&c, &engine_options);
+  }
   if (!e)
     return 0;
   uint64_t t = 0;
@@ -60,7 +72,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     const char *group = (op & 1) ? "a" : "b";
     uint64_t event_time = (op & 2) ? t / 2 : t;
-    if (store && (op & 8))
+    if (store >= 2 && (op & 8))
       bishfpm_prune_pairs(e, group, event_time, 1 + op % 16);
     else if (op & 4)
       bishfpm_prune(e, event_time, .01);
@@ -74,6 +86,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
            st.memory_bound_bytes <= c.max_memory_bytes);
     assert(st.events_total ==
            st.events_accepted + st.events_rejected + st.events_noop);
+    bishfpm_memory_stats_t memory;
+    bishfpm_get_memory_stats(e, &memory);
+    assert(memory.current_bytes == st.memory_current_bytes);
+    if (memory.mode == BISHFPM_MEMORY_DYNAMIC)
+      assert(memory.current_bytes <= memory.peak_bytes &&
+             memory.peak_bytes <= memory.limit_bytes);
     bishfpm_rejection_stats_t reasons;
     bishfpm_get_rejection_stats(e, &reasons);
     assert(reasons.invalid_input + reasons.event_items_limit +

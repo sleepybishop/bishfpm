@@ -105,6 +105,26 @@ int main(void) {
   assert(bishfpm_arena_used(NULL) == 0);
   assert(bishfpm_rate_table_count(NULL) == 0);
   assert(bishfpm_topk_storage_bytes(NULL) == 0);
+  bishfpm_topk_t *fss = bishfpm_topk_new_fss(1, 1000, 1, 42);
+  assert(fss);
+  assert(bishfpm_topk_add(fss, "a", 10, 0) == 10);
+  assert(bishfpm_topk_add(fss, "b", 1, 0) == 1);
+  bishfpm_topk_bounds_t bounds;
+  assert(bishfpm_topk_bounds(fss, "b", 0, &bounds));
+  assert(bounds.known && !bounds.resident && bounds.lower == 0 &&
+         bounds.upper == 1);
+  assert(!bishfpm_topk_try_set_seed(fss, 43));
+  bishfpm_topk_reset(fss);
+  assert(bishfpm_topk_try_set_seed(fss, 43));
+  bishfpm_topk_free(fss);
+  arena = bishfpm_arena_new_buffer(buffer, sizeof(buffer));
+  assert(arena);
+  fss = bishfpm_topk_new_fss_arena(arena, 4, 1000, 17, 42);
+  assert(fss);
+  assert(bishfpm_topk_add(fss, "a", 1, 0) == 1);
+  bishfpm_topk_free(fss);
+  bishfpm_arena_free(arena);
+
   puts("test_lowlevel passed.");
   return 0;
 }

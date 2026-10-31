@@ -1,9 +1,9 @@
 # Prior art
 
 The current implementation combines marginal admission gates, exponential time
-decay, partition-relative concentration thresholds and a decayed weighted
-SpaceSaving summary of encoded itemsets or numeric pairs. These are established
-techniques.
+decay, partition-relative concentration thresholds and decayed weighted
+SpaceSaving or experimental Filtered SpaceSaving summaries of encoded itemsets
+or numeric pairs. A threshold store is also available for numeric pairs.
 
 A transaction with M items has $2^M - 1$ possible nonempty subsets. Candidate
 generation determines which combinations reach the counters; heavy-hitter stores
@@ -15,13 +15,12 @@ itemset order limits the combinations considered.
 | Source | Inherited mechanism | Bishfpm adaptation and limits |
 | --- | --- | --- |
 | Metwally, Agrawal and El Abbadi, SpaceSaving [4] | Minimum-counter replacement with inherited admission error | Weighted string itemsets or numeric pairs, elapsed-time decay, and pruning that preserves omitted-history bounds. Intervals cover evaluated candidates; gates censor history and true top-k ranking is not guaranteed. |
-| Homem and Carvalho, Filtered SpaceSaving [14]; the [`topk` 0.7.0 reference implementation](https://docs.rs/topk/0.7.0/src/topk/topk/mod.rs.html) | Bucket history filters misses before minimum-counter replacement | Numeric pairs, decayed bucket bounds, weighted/late updates, and history-preserving pruning. |
+| Homem and Carvalho, Filtered SpaceSaving [14]; the [`topk` 0.7.0 reference implementation](https://docs.rs/topk/0.7.0/src/topk/topk/mod.rs.html) | Bucket history filters misses before minimum-counter replacement | String itemsets or numeric pairs, decayed bucket bounds, weighted/late updates, and history-preserving pruning. Bounds cover evaluated candidates; disable both marginal gates for full transaction history. |
 
 ## Related work
 
 The following works provide context for decay, transactional mining, relative
-concentration and explanations. Conceptual parallels do not establish direct
-implementation ancestry or transfer their guarantees.
+concentration and explanations.
 
 - **Stream Frequency & Transactional Summaries**: Manku and Motwani [1] introduced
   Lossy Counting for approximate frequency over data streams, including an extension
