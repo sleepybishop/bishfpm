@@ -1,0 +1,12 @@
+#ifndef BISHFPM_VERSION_H
+#define BISHFPM_VERSION_H
+#define BISHFPM_VERSION_MAJOR 0
+#define BISHFPM_VERSION_MINOR 2
+#define BISHFPM_VERSION_PATCH 0
+#define BISHFPM_STRINGIFY_(x) #x
+#define BISHFPM_STRINGIFY(x) BISHFPM_STRINGIFY_(x)
+#define BISHFPM_VERSION_STRING                                                 \
+  BISHFPM_STRINGIFY(BISHFPM_VERSION_MAJOR)                                     \
+  "." BISHFPM_STRINGIFY(BISHFPM_VERSION_MINOR) "." BISHFPM_STRINGIFY(          \
+      BISHFPM_VERSION_PATCH)
+#endif
