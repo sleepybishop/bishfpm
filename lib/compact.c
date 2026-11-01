@@ -96,11 +96,7 @@ static void slot_map_rebuild(compact_t *store) {
 
 static inline double item_rate(const compact_entry_t *item, uint64_t now_ms,
                                double half_life_ms) {
-  if (now_ms <= item->last_time_ms) {
-    return item->rate;
-  }
-  return bishfpm_rate_decay(item->rate, now_ms - item->last_time_ms,
-                            half_life_ms);
+  return decay_since(item->rate, item->last_time_ms, now_ms, half_life_ms);
 }
 
 static void heapify_up(compact_t *store, uint32_t idx, uint64_t now_ms) {
@@ -122,16 +118,36 @@ static void heapify_up(compact_t *store, uint32_t idx, uint64_t now_ms) {
 }
 
 static void heapify_down(compact_t *store, uint32_t idx, uint64_t now_ms) {
+  uint32_t child = 2 * idx + 1;
+  if (child >= store->heap_size)
+    return;
+  double held_rate = item_rate(&store->heap[idx], now_ms, store->half_life_ms);
+  double child_rate =
+      item_rate(&store->heap[child], now_ms, store->half_life_ms);
+  if (child + 1 < store->heap_size) {
+    double right_rate =
+        item_rate(&store->heap[child + 1], now_ms, store->half_life_ms);
+    if (right_rate < child_rate) {
+      child++;
+      child_rate = right_rate;
+    }
+  }
+  if (!(child_rate < held_rate))
+    return;
   /* Move children through a hole, then place the updated entry once.
    * Repair indices as entries move; strict comparisons preserve tie order. */
   compact_entry_t held = store->heap[idx];
   size_t held_slot = slot_for_index(store, idx);
-  double held_rate = item_rate(&held, now_ms, store->half_life_ms);
   uint32_t hole = idx;
-  while (2 * hole + 1 < store->heap_size) {
-    uint32_t child = 2 * hole + 1;
-    double child_rate =
-        item_rate(&store->heap[child], now_ms, store->half_life_ms);
+  for (;;) {
+    size_t child_slot = slot_for_index(store, child);
+    store->heap[hole] = store->heap[child];
+    store->slot_map[child_slot] = hole + 1;
+    hole = child;
+    child = 2 * hole + 1;
+    if (child >= store->heap_size)
+      break;
+    child_rate = item_rate(&store->heap[child], now_ms, store->half_life_ms);
     if (child + 1 < store->heap_size) {
       double right_rate =
           item_rate(&store->heap[child + 1], now_ms, store->half_life_ms);
@@ -142,15 +158,9 @@ static void heapify_down(compact_t *store, uint32_t idx, uint64_t now_ms) {
     }
     if (!(child_rate < held_rate))
       break;
-    size_t child_slot = slot_for_index(store, child);
-    store->heap[hole] = store->heap[child];
-    store->slot_map[child_slot] = hole + 1;
-    hole = child;
   }
-  if (hole != idx) {
-    store->heap[hole] = held;
-    store->slot_map[held_slot] = hole + 1;
-  }
+  store->heap[hole] = held;
+  store->slot_map[held_slot] = hole + 1;
 }
 
 /* Bulk heapification uses the same tie order without consulting the index.
@@ -249,7 +259,7 @@ static size_t fss_bucket(const compact_t *t, uint64_t hash) {
 }
 static double fss_alpha(const compact_t *t, uint64_t hash, uint64_t now) {
   const bishfpm_sketch_cell_t *cell = &t->sketch[fss_bucket(t, hash)];
-  return bishfpm_rate_decay(cell->count, now - cell->time_ms, t->half_life_ms);
+  return decay_since(cell->count, cell->time_ms, now, t->half_life_ms);
 }
 static void fss_record(compact_t *t, uint64_t hash, double upper,
                        uint64_t now) {
@@ -258,8 +268,8 @@ static void fss_record(compact_t *t, uint64_t hash, double upper,
   cell->time_ms = now;
 }
 static void fss_advance(compact_t *t, uint64_t now, double total) {
-  t->omitted_bound = bishfpm_rate_decay(t->omitted_bound, now - t->max_time_ms,
-                                        t->half_life_ms);
+  t->omitted_bound =
+      decay_since(t->omitted_bound, t->max_time_ms, now, t->half_life_ms);
   t->max_time_ms = now;
   t->sketch_total = total;
 }
@@ -268,10 +278,9 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
                              double increment, uint64_t timestamp) {
   topk_result_t r = {0};
   uint64_t now = effective_time(timestamp, t->max_time_ms);
-  double weight =
-      bishfpm_rate_decay(increment, now - timestamp, t->half_life_ms);
-  double total = bishfpm_rate_decay(t->sketch_total, now - t->max_time_ms,
-                                    t->half_life_ms);
+  double weight = decay_since(increment, timestamp, now, t->half_life_ms);
+  double total =
+      decay_since(t->sketch_total, t->max_time_ms, now, t->half_life_ms);
   if (weight > DBL_MAX - total)
     return r;
 
@@ -283,8 +292,8 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
       return r;
 
     fss_advance(t, now, total + weight);
-    entry->error = bishfpm_rate_decay(entry->error, now - entry->last_time_ms,
-                                      t->half_life_ms);
+    entry->error =
+        decay_since(entry->error, entry->last_time_ms, now, t->half_life_ms);
     entry->rate = rate + weight;
     entry->last_time_ms = now;
     r.present = r.was_present = true;
@@ -354,9 +363,9 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
   uint64_t timestamp = now_ms;
   now_ms = effective_time(timestamp, store->max_time_ms);
   double weight =
-      bishfpm_rate_decay(increment, now_ms - timestamp, store->half_life_ms);
-  double omitted_bound = bishfpm_rate_decay(
-      store->omitted_bound, now_ms - store->max_time_ms, store->half_life_ms);
+      decay_since(increment, timestamp, now_ms, store->half_life_ms);
+  double omitted_bound = decay_since(store->omitted_bound, store->max_time_ms,
+                                     now_ms, store->half_life_ms);
   result.time_ms = now_ms;
   uint32_t idx;
   if (slot_map_find(store, key, hash, &idx)) {
@@ -367,8 +376,8 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
       return result;
     store->omitted_bound = omitted_bound;
     store->max_time_ms = now_ms;
-    item->error = bishfpm_rate_decay(item->error, now_ms - item->last_time_ms,
-                                     store->half_life_ms);
+    item->error = decay_since(item->error, item->last_time_ms, now_ms,
+                              store->half_life_ms);
     item->rate = decayed + weight;
     item->last_time_ms = now_ms;
     result.present = true;
@@ -426,17 +435,17 @@ topk_result_t compact_query(const compact_t *store, uint64_t key, uint64_t hash,
     if (store->kind == BISHFPM_PAIR_FSS)
       result.upper = result.error = fss_alpha(store, hash, result.time_ms);
     if (store->kind == BISHFPM_PAIR_THRESHOLD)
-      result.upper = result.error = bishfpm_rate_decay(
-          store->omitted_bound, result.time_ms - store->max_time_ms,
-          store->half_life_ms);
+      result.upper = result.error =
+          decay_since(store->omitted_bound, store->max_time_ms, result.time_ms,
+                      store->half_life_ms);
     return result;
   }
   const compact_entry_t *item = &store->heap[idx];
   result.present = result.was_present = true;
   result.upper = item_rate(item, result.time_ms, store->half_life_ms);
-  result.lower = bishfpm_rate_decay(fmax(0, item->rate - item->error),
-                                    result.time_ms - item->last_time_ms,
-                                    store->half_life_ms);
+  result.lower =
+      decay_since(fmax(0, item->rate - item->error), item->last_time_ms,
+                  result.time_ms, store->half_life_ms);
   result.error = result.upper - result.lower;
   return result;
 }

@@ -43,11 +43,12 @@ typedef struct {
 
 /* top-k min-heap item */
 typedef struct {
-  char pattern[BISHFPM_TOPK_MAX_STR];
   uint64_t hash;
   double rate;
   double error;
   uint64_t last_time_ms;
+  uint16_t length;
+  char pattern[BISHFPM_TOPK_MAX_STR];
 } bishfpm_heap_entry_t;
 
 /* slot map entry for O(1) heap position lookup */

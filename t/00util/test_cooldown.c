@@ -44,10 +44,7 @@ static int update(bishfpm_group_t *g, unsigned id, uint64_t now,
                   bool *saturated) {
   return update_hashed(g, id, id, now, saturated);
 }
-static void release(bishfpm_group_t *g) {
-  free(g->cooldowns);
-  free(g->cooldown_spare);
-}
+static void release(bishfpm_group_t *g) { free(g->cooldowns); }
 static void reuse_and_saturation(void) {
   bishfpm_group_t g = group(COOLDOWN_GROWTH_LIMIT);
   bool saturated;
@@ -60,11 +57,11 @@ static void reuse_and_saturation(void) {
   assert(update(&g, 0, 999, &saturated) && !saturated);
   assert(rebuild_allocations == 0);
   assert(!update(&g, 5000, 1100, &saturated) && !saturated);
-  assert(g.cooldown_count == 1 && rebuild_allocations == 1);
+  assert(g.cooldown_count == 1 && rebuild_allocations == 0);
   for (unsigned i = 0; i < COOLDOWN_GROWTH_LIMIT - 1; i++)
     assert(!update(&g, i, 1100, &saturated) && !saturated);
   assert(!update(&g, 6000, 1200, &saturated) && !saturated);
-  assert(g.cooldown_count == 1 && rebuild_allocations == 1);
+  assert(g.cooldown_count == 1 && rebuild_allocations == 0);
   assert(update(&g, 6000, 1100, &saturated) && !saturated);
   release(&g);
 }
@@ -90,7 +87,7 @@ static void allocation_failure(void) {
   void *active = g.cooldowns;
   fail_rebuild = 1;
   assert(!update(&g, 5000, 1100, &saturated) && !saturated);
-  assert(g.cooldowns == active && g.cooldown_count == COOLDOWN_GROWTH_LIMIT);
+  assert(g.cooldowns == active && g.cooldown_count == 1);
   assert(update(&g, 5000, 1100, &saturated) && !saturated);
   fail_rebuild = 0;
   assert(!update(&g, 5001, 1100, &saturated) && !saturated);
@@ -189,12 +186,12 @@ static void memory_accounting(void) {
     assert(e);
     assert(bishfpm_add_event(e, "g", 1000, items, 12, NULL, NULL) == 66);
     bishfpm_group_t *g = find_group(e, "g", NULL);
-    size_t slots_before = g->cooldown_cap + g->cooldown_spare_cap;
+    size_t slots_before = g->cooldown_cap;
     bishfpm_stats_t before, after;
     bishfpm_get_stats(e, &before);
     assert(bishfpm_add_event(e, "g", 1100, items, 12, NULL, NULL) == 66);
     bishfpm_get_stats(e, &after);
-    size_t slots_after = g->cooldown_cap + g->cooldown_spare_cap;
+    size_t slots_after = g->cooldown_cap;
     assert(after.memory_current_bytes - before.memory_current_bytes ==
            (slots_after - slots_before) *
                (sizeof(pair_cooldown_t) + 2 * sizeof(uint32_t)));

@@ -13,6 +13,11 @@ static inline uint64_t effective_time(uint64_t requested, uint64_t watermark) {
   return requested > watermark ? requested : watermark;
 }
 
+static inline double decay_since(double count, uint64_t then, uint64_t now,
+                                 double half) {
+  return now <= then ? count : bishfpm_rate_decay(count, now - then, half);
+}
+
 static inline size_t next_pow2(size_t v) {
   if (v > (SIZE_MAX >> 1))
     return 0;

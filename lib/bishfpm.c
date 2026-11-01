@@ -16,6 +16,7 @@ typedef struct {
   size_t length;
   uint64_t hash;
   double marginal;
+  bishfpm_rate_entry_t *entry;
 } prepared_item_t;
 
 typedef struct {
@@ -37,7 +38,6 @@ typedef struct {
   uint64_t hash;
   uint64_t last_trigger_ms;
   uint32_t item_count;
-  bool occupied;
 } bishfpm_cooldown_entry_t;
 
 typedef struct {
@@ -85,8 +85,8 @@ typedef struct {
   bishfpm_topk_t *topk;
   compact_t *pairs;
   bishfpm_arena_t *arena;
-  void *cooldowns, *cooldown_spare;
-  size_t cooldown_cap, cooldown_count, cooldown_spare_cap;
+  void *cooldowns;
+  size_t cooldown_cap, cooldown_count;
   /* Lower bound on the oldest trigger; refreshed during maintenance. */
   uint64_t cooldown_oldest_ms;
   uint64_t max_time_ms;
@@ -278,9 +278,8 @@ static size_t memory_bound(const bishfpm_config_t *c,
   /* Include simultaneous old/new tables, all final key copies and the
    * bounded staging array. Pruning/growth never exceeds these capacities. */
   uint64_t per_group =
-      sizeof(bishfpm_group_t) + BISHFPM_MAX_GROUP_KEY_LEN +
-      sizeof(bishfpm_rate_table_t) + sizeof(bishfpm_arena_t) +
-      layout.arena_bytes + pair_bytes +
+      BISHFPM_MAX_GROUP_KEY_LEN + sizeof(bishfpm_rate_table_t) +
+      (pairs ? 0 : sizeof(bishfpm_arena_t)) + layout.arena_bytes + pair_bytes +
       2 * (uint64_t)rate_cap * sizeof(bishfpm_rate_entry_t) +
       (uint64_t)c->max_items_per_group * BISHFPM_MAX_ITEM_LEN +
       (uint64_t)staged * sizeof(bishfpm_rate_entry_t) +
@@ -409,9 +408,6 @@ static void free_group_resources(bishfpm_group_t *grp) {
                 grp->cooldown_cap *
                     (cooldown_entry_size(numeric) + 2 * sizeof(uint32_t)));
   }
-  memory_free(grp->budget, grp->cooldown_spare,
-              grp->cooldown_spare_cap *
-                  (cooldown_entry_size(numeric) + 2 * sizeof(uint32_t)));
   memset(grp, 0, sizeof(bishfpm_group_t));
 }
 
@@ -623,43 +619,13 @@ find_cooldown(bishfpm_group_t *grp, uint64_t hash, const void *identity) {
   return NULL;
 }
 
-/* Rebuild only to reclaim expired entries or grow. Keep the previous table as
- * reusable storage; allocation failure leaves the active table unchanged. */
+/* expire entries in place without allocating; only allocate on growth */
 static size_t cooldown_maintain(bishfpm_group_t *grp, size_t capacity,
                                 uint64_t now_ms, uint64_t cooldown_ms,
                                 bool expire) {
   size_t stride = cooldown_entry_size(grp->pairs != NULL);
-  size_t occupied = 0;
   uint64_t oldest = UINT64_MAX;
   uint64_t ref_time = effective_time(now_ms, grp->max_time_ms);
-  for (size_t i = 0; i < grp->cooldown_count; i++) {
-    const bishfpm_cooldown_entry_t *entry =
-        cooldown_entry(grp->cooldowns, i, stride);
-    if (expire && ref_time >= entry->last_trigger_ms &&
-        ref_time - entry->last_trigger_ms >= cooldown_ms)
-      continue;
-    occupied++;
-    if (entry->last_trigger_ms < oldest)
-      oldest = entry->last_trigger_ms;
-  }
-  if (occupied == grp->cooldown_count && capacity == grp->cooldown_cap) {
-    grp->cooldown_oldest_ms = oldest;
-    return occupied;
-  }
-  size_t bytes_per_entry = stride + 2 * sizeof(uint32_t);
-  if (grp->cooldown_spare_cap != capacity) {
-    memory_free(grp->budget, grp->cooldown_spare,
-                grp->cooldown_spare_cap * bytes_per_entry);
-    grp->cooldown_spare = NULL;
-    grp->cooldown_spare_cap = 0;
-    grp->cooldown_spare = memory_calloc(grp->budget, capacity, bytes_per_entry);
-    if (!grp->cooldown_spare)
-      return grp->cooldown_count;
-    grp->cooldown_spare_cap = capacity;
-  } else {
-    memset(grp->cooldown_spare, 0, capacity * bytes_per_entry);
-  }
-  void *table = grp->cooldown_spare;
   size_t count = 0;
   for (size_t i = 0; i < grp->cooldown_count; i++) {
     const bishfpm_cooldown_entry_t *entry =
@@ -667,16 +633,47 @@ static size_t cooldown_maintain(bishfpm_group_t *grp, size_t capacity,
     if (expire && ref_time >= entry->last_trigger_ms &&
         ref_time - entry->last_trigger_ms >= cooldown_ms)
       continue;
-    memcpy(cooldown_entry(table, count, stride), entry, stride);
-    cooldown_index_insert(table, capacity, stride, count++);
+    if (entry->last_trigger_ms < oldest)
+      oldest = entry->last_trigger_ms;
+    if (count != i)
+      memcpy(cooldown_entry(grp->cooldowns, count, stride), entry, stride);
+    count++;
   }
-  grp->cooldown_spare = grp->cooldowns;
-  grp->cooldown_spare_cap = grp->cooldown_cap;
+  if (capacity == grp->cooldown_cap) {
+    if (count != grp->cooldown_count) {
+      memset(cooldown_index(grp->cooldowns, capacity, stride), 0,
+             2 * capacity * sizeof(uint32_t));
+      for (size_t i = 0; i < count; i++)
+        cooldown_index_insert(grp->cooldowns, capacity, stride, i);
+      grp->cooldown_count = count;
+    }
+    grp->cooldown_oldest_ms = oldest;
+    return count;
+  }
+  size_t bytes_per_entry = stride + 2 * sizeof(uint32_t);
+  void *table = memory_calloc(grp->budget, capacity, bytes_per_entry);
+  if (!table) {
+    if (count != grp->cooldown_count) {
+      memset(cooldown_index(grp->cooldowns, grp->cooldown_cap, stride), 0,
+             2 * grp->cooldown_cap * sizeof(uint32_t));
+      for (size_t i = 0; i < count; i++)
+        cooldown_index_insert(grp->cooldowns, grp->cooldown_cap, stride, i);
+      grp->cooldown_count = count;
+    }
+    grp->cooldown_oldest_ms = oldest;
+    return count;
+  }
+  if (count) {
+    memcpy(table, grp->cooldowns, count * stride);
+    for (size_t i = 0; i < count; i++)
+      cooldown_index_insert(table, capacity, stride, i);
+  }
+  memory_free(grp->budget, grp->cooldowns, grp->cooldown_cap * bytes_per_entry);
   grp->cooldowns = table;
   grp->cooldown_cap = capacity;
-  grp->cooldown_count = occupied;
+  grp->cooldown_count = count;
   grp->cooldown_oldest_ms = oldest;
-  return occupied;
+  return count;
 }
 
 /* Check cooldown and record notification identity independently of residency.
@@ -697,84 +694,36 @@ static bool check_and_update_cooldown(bishfpm_group_t *grp, uint64_t hash,
     if (now_ms < existing->last_trigger_ms ||
         now_ms - existing->last_trigger_ms < cooldown_ms)
       return true;
-    existing->last_trigger_ms = now_ms;
+    existing->last_trigger_ms = ref_time;
     existing->item_count = item_count;
     return false;
   }
-  size_t slot;
 
   bool can_expire = grp->cooldown_count &&
                     ref_time >= grp->cooldown_oldest_ms &&
                     ref_time - grp->cooldown_oldest_ms >= cooldown_ms;
   if (grp->cooldown_count * 10 >= grp->cooldown_cap * 7) {
     if (can_expire)
-      cooldown_maintain(grp, grp->cooldown_cap, now_ms, cooldown_ms, true);
+      cooldown_maintain(grp, grp->cooldown_cap, ref_time, cooldown_ms, true);
     if (grp->cooldown_count * 10 >= grp->cooldown_cap * 7 &&
         grp->cooldown_cap < COOLDOWN_GROWTH_LIMIT)
-      cooldown_maintain(grp, grp->cooldown_cap * 2, now_ms, cooldown_ms, false);
+      cooldown_maintain(grp, grp->cooldown_cap * 2, ref_time, cooldown_ms,
+                        false);
   }
 
-  /* Maintenance may have refreshed a stale lower bound without removing any
-   * entries. Avoid a second full scan when all identities are active. */
-  can_expire = grp->cooldown_count && ref_time >= grp->cooldown_oldest_ms &&
-               ref_time - grp->cooldown_oldest_ms >= cooldown_ms;
-  size_t entry_index = grp->cooldown_count;
   if (grp->cooldown_count == grp->cooldown_cap) {
-    if (!can_expire) {
-      *saturated = true;
-      return true;
-    }
-    /* Allocation-free fallback. Track the next oldest timestamp while finding
-     * the expired victim, and repair its index before replacing its identity.
-     */
-    uint64_t oldest = UINT64_MAX, next = UINT64_MAX;
-    entry_index = 0;
-    for (size_t i = 0; i < grp->cooldown_count; i++) {
-      uint64_t time =
-          cooldown_entry(grp->cooldowns, i, stride)->last_trigger_ms;
-      if (time < oldest) {
-        next = oldest;
-        oldest = time;
-        entry_index = i;
-      } else if (time < next) {
-        next = time;
-      }
-    }
-    if (ref_time < oldest || ref_time - oldest < cooldown_ms) {
-      grp->cooldown_oldest_ms = oldest;
-      *saturated = true;
-      return true;
-    }
-    size_t mask = 2 * grp->cooldown_cap - 1;
-    uint32_t *index = cooldown_index(grp->cooldowns, grp->cooldown_cap, stride);
-    slot = cooldown_entry(grp->cooldowns, entry_index, stride)->hash & mask;
-    while (index[slot] != entry_index + 1)
-      slot = (slot + 1) & mask;
-    size_t hole = slot;
-    for (size_t probe = (slot + 1) & mask; index[probe];
-         probe = (probe + 1) & mask) {
-      size_t home =
-          cooldown_entry(grp->cooldowns, index[probe] - 1, stride)->hash & mask;
-      if (((probe - home) & mask) >= ((probe - hole) & mask)) {
-        index[hole] = index[probe];
-        hole = probe;
-      }
-    }
-    index[hole] = 0;
-    grp->cooldown_oldest_ms = next;
-  } else {
-    grp->cooldown_count++;
+    *saturated = true;
+    return true;
   }
-
+  size_t entry_index = grp->cooldown_count++;
   bishfpm_cooldown_entry_t *entry =
       cooldown_entry(grp->cooldowns, entry_index, stride);
   entry->hash = hash;
   cooldown_set_identity(entry, identity, numeric);
-  entry->last_trigger_ms = now_ms;
+  entry->last_trigger_ms = ref_time;
   entry->item_count = item_count;
-  entry->occupied = true;
-  if (grp->cooldown_count == 1 || now_ms < grp->cooldown_oldest_ms)
-    grp->cooldown_oldest_ms = now_ms;
+  if (grp->cooldown_count == 1 || ref_time < grp->cooldown_oldest_ms)
+    grp->cooldown_oldest_ms = ref_time;
   cooldown_index_insert(grp->cooldowns, grp->cooldown_cap, stride, entry_index);
   return false;
 }
@@ -818,40 +767,44 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
                                   uint64_t now_ms, uint64_t cooldown_ms,
                                   double subsumption_ratio, size_t min_order,
                                   uint64_t hash_seed) {
-  if (grp->pairs || subsumption_ratio <= 0.0 || !grp->cooldowns ||
-      !grp->cooldown_count || subset_len <= min_order) {
+  if (grp->pairs || subsumption_ratio <= 0.0 || !cooldown_ms ||
+      !grp->cooldowns || !grp->cooldown_count || subset_len <= min_order) {
     return false;
   }
-  if (subset_len == 3 && min_order == 2 && grp->cooldown_count > 3) {
-    size_t lengths[3];
-    for (size_t i = 0; i < 3; i++)
+  if ((subset_len == 3 || subset_len == 4) && min_order == 2 &&
+      grp->cooldown_count > (subset_len == 3 ? 3u : 10u)) {
+    size_t lengths[4];
+    for (size_t i = 0; i < subset_len; i++)
       lengths[i] = strlen(subset_items[i]);
-    char pair[BISHFPM_MAX_PATTERN_LEN];
-    for (size_t i = 0; i < 2; i++) {
-      memcpy(pair, subset_items[i], lengths[i]);
-      pair[lengths[i]] = BISHFPM_ITEM_DELIM;
-      for (size_t j = i + 1; j < 3; j++) {
-        size_t length = lengths[i] + 1 + lengths[j];
-        memcpy(pair + lengths[i] + 1, subset_items[j], lengths[j] + 1);
-        uint64_t hash = bishfpm_murmur3_64(pair, length, hash_seed);
-        const bishfpm_cooldown_entry_t *entry = find_cooldown(grp, hash, pair);
-        if (!entry || (now_ms > entry->last_trigger_ms &&
-                       now_ms - entry->last_trigger_ms >= cooldown_ms))
+    char sub[BISHFPM_MAX_PATTERN_LEN];
+    unsigned limit = (1u << subset_len) - 1;
+    for (unsigned mask = 3; mask < limit; mask++) {
+      if (!(mask & (mask - 1)))
+        continue;
+      size_t length = 0;
+      for (size_t i = 0; i < subset_len; i++) {
+        if (!(mask & (1u << i)))
           continue;
-        double parent_rate = bishfpm_topk_query_lower(grp->topk, pair, now_ms);
-        if (parent_rate > 0.0 &&
-            candidate_rate < subsumption_ratio * parent_rate)
-          return true;
+        if (length)
+          sub[length++] = BISHFPM_ITEM_DELIM;
+        memcpy(sub + length, subset_items[i], lengths[i]);
+        length += lengths[i];
       }
+      sub[length] = '\0';
+      uint64_t hash = bishfpm_murmur3_64(sub, length, hash_seed);
+      const bishfpm_cooldown_entry_t *entry = find_cooldown(grp, hash, sub);
+      if (!entry || (now_ms >= entry->last_trigger_ms &&
+                     now_ms - entry->last_trigger_ms >= cooldown_ms))
+        continue;
+      double parent_rate = bishfpm_topk_query_lower(grp->topk, sub, now_ms);
+      if (parent_rate > 0.0 && candidate_rate < subsumption_ratio * parent_rate)
+        return true;
     }
     return false;
   }
   for (size_t i = 0; i < grp->cooldown_count; i++) {
     const text_cooldown_t *slot = (const text_cooldown_t *)grp->cooldowns + i;
-    if (!slot->entry.occupied) {
-      continue;
-    }
-    if (now_ms > slot->entry.last_trigger_ms &&
+    if (now_ms >= slot->entry.last_trigger_ms &&
         now_ms - slot->entry.last_trigger_ms >= cooldown_ms) {
       continue; /* expired */
     }
@@ -870,37 +823,18 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
 }
 
 /* compute statistical lift of candidate subset */
-static double compute_subset_lift(const prepared_event_t *event,
-                                  const char *const *subset_items,
-                                  size_t subset_len, double p_rate,
-                                  double group_rate,
-                                  const double *known_marginals) {
+static double compute_subset_lift(size_t subset_len, double p_rate,
+                                  double group_rate, const double *marginals) {
   if (subset_len < 2 || group_rate <= 0.0 || p_rate <= 0.0) {
     return 1.0;
   }
   double r_indep = group_rate;
-  double marginals[BISHFPM_MAX_ITEMSET_ORDER];
   bool needs_scaling = false;
-  size_t lo = 0;
   for (size_t i = 0; i < subset_len; i++) {
-    double ir;
-    if (known_marginals) {
-      ir = known_marginals[i];
-    } else {
-      size_t hi = event->count;
-      while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (strcmp(event->items[mid].key, subset_items[i]) < 0)
-          lo = mid + 1;
-        else
-          hi = mid;
-      }
-      ir = event->items[lo++].marginal;
-    }
+    double ir = marginals[i];
     if (ir <= 0.0) {
       return 1.0;
     }
-    marginals[i] = ir;
     double share = ir / group_rate;
     r_indep *= share;
     if (!isnormal(share) || !isnormal(r_indep))
@@ -960,7 +894,7 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
                              const char *const *subset_items, size_t subset_len,
                              topk_result_t update, const char *pattern,
                              uint64_t key, uint64_t hash,
-                             const double *known_marginals) {
+                             const double *marginals) {
   char numeric_pattern[BISHFPM_MAX_PATTERN_LEN];
   double p_rate = update.lower;
   double frac = ctx->group_rate > 0.0 ? (p_rate / ctx->group_rate) : 0.0;
@@ -968,8 +902,7 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
   /* check statistical lift threshold if configured */
   double lift = 0.0;
   if (ctx->engine->cfg.min_lift > 0.0) {
-    lift = compute_subset_lift(ctx->event, subset_items, subset_len, p_rate,
-                               ctx->group_rate, known_marginals);
+    lift = compute_subset_lift(subset_len, p_rate, ctx->group_rate, marginals);
     if (lift < ctx->engine->cfg.min_lift) {
       ctx->engine->stats.triggers_suppressed++;
       return; /* lack of positive statistical correlation */
@@ -1010,8 +943,8 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
 
   if (ctx->cb) {
     if (ctx->engine->cfg.min_lift <= 0.0)
-      lift = compute_subset_lift(ctx->event, subset_items, subset_len, p_rate,
-                                 ctx->group_rate, known_marginals);
+      lift =
+          compute_subset_lift(subset_len, p_rate, ctx->group_rate, marginals);
     bishfpm_trigger_t trig;
     memset(&trig, 0, sizeof(trig));
     snprintf(trig.pattern, sizeof(trig.pattern), "%s", pattern);
@@ -1034,8 +967,8 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
  * Append each prefix once per order, preserving lexicographic enumeration. */
 static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
                                   size_t target, size_t start, size_t depth,
-                                  const char **items, char *pattern,
-                                  size_t length) {
+                                  const char **items, double *marginals,
+                                  char *pattern, size_t length) {
   if (depth == target) {
     pattern[length] = 0;
     topk_result_t update = topk_add_sized(ctx->grp->topk, pattern, length,
@@ -1055,7 +988,7 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
     p->replacements += update.replaced;
     if (candidate_promoted(ctx, depth, update))
       notify_candidate(ctx, items, depth, update, pattern, 0, update.hash,
-                       NULL);
+                       marginals);
     return;
   }
   size_t needed = target - depth;
@@ -1063,11 +996,13 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
     size_t pos = length;
     if (depth)
       pattern[pos++] = BISHFPM_ITEM_DELIM;
-    size_t item_length = ctx->event->lengths[i];
-    items[depth] = ctx->event->keys[i];
-    memcpy(pattern + pos, items[depth], item_length);
-    evaluate_combinations(ctx, count, target, i + 1, depth + 1, items, pattern,
-                          pos + item_length);
+    const prepared_item_t *item = &ctx->event->items[i];
+    size_t item_length = item->length;
+    items[depth] = item->key;
+    marginals[depth] = item->marginal;
+    memcpy(pattern + pos, item->key, item_length);
+    evaluate_combinations(ctx, count, target, i + 1, depth + 1, items,
+                          marginals, pattern, pos + item_length);
   }
 }
 static int compare_lengths(const void *a, const void *b) {
@@ -1093,7 +1028,7 @@ static int prepare_event(bishfpm_t *engine, const char *const *items,
     if (length >= BISHFPM_MAX_ITEM_LEN ||
         memchr(items[i], BISHFPM_ITEM_DELIM, length))
       return -1;
-    event->items[valid++] = (prepared_item_t){items[i], length, 0, 0};
+    event->items[valid++] = (prepared_item_t){items[i], length, 0, 0, NULL};
   }
   qsort(event->items, valid, sizeof(*event->items), compare_prepared_items);
   event->count = 0;
@@ -1196,13 +1131,18 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     goto finalize;
   }
   bool forget_before_commit = false;
+  size_t missing_marginals = 0;
+  uint32_t next_id = (uint32_t)grp->item_rates->count;
+  for (size_t i = 0; i < event->count; i++) {
+    bishfpm_rate_entry_t *entry = rate_table_find(
+        grp->item_rates, event->items[i].key, event->items[i].hash);
+    event->items[i].entry = entry;
+    if (!entry)
+      missing_marginals++;
+    if (engine->numeric_pairs)
+      event->ids[i] = entry ? entry->id : next_id++;
+  }
   if (engine->numeric_pairs) {
-    uint32_t next = (uint32_t)grp->item_rates->count;
-    for (size_t i = 0; i < event->count; i++) {
-      bishfpm_rate_entry_t *entry = rate_table_find(
-          grp->item_rates, event->keys[i], event->items[i].hash);
-      event->ids[i] = entry ? entry->id : next++;
-    }
     if (!compact_reserve(grp->pairs, event->ids, event->count,
                          effective_time(timestamp_ms, grp->max_time_ms),
                          &forget_before_commit)) {
@@ -1216,21 +1156,27 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
       goto finalize;
     }
   }
-  rate_prepare_result_t reservation =
-      rate_table_prepare_result(grp->item_rates, event->keys, event->count);
-  if (reservation != RATE_PREPARED) {
-    reason = reservation == RATE_LIMIT ? REJECT_MARGINALS : REJECT_ALLOCATION;
-    if (engine->group_count != old_group_count) {
-      free_group_resources(grp);
-      engine->group_count--;
+  if (missing_marginals) {
+    rate_prepare_result_t reservation =
+        rate_table_prepare_result(grp->item_rates, event->keys, event->count);
+    if (reservation != RATE_PREPARED) {
+      reason = reservation == RATE_LIMIT ? REJECT_MARGINALS : REJECT_ALLOCATION;
+      if (engine->group_count != old_group_count) {
+        free_group_resources(grp);
+        engine->group_count--;
+      }
+      budget_rejection = reservation == RATE_LIMIT;
+      goto finalize;
     }
-    budget_rejection = reservation == RATE_LIMIT;
-    goto finalize;
+    for (size_t i = 0; i < event->count; i++) {
+      event->items[i].entry = rate_table_find(
+          grp->item_rates, event->items[i].key, event->items[i].hash);
+    }
   }
 
   uint64_t now = effective_time(timestamp_ms, grp->max_time_ms);
-  double effective_weight = bishfpm_rate_decay(
-      (double)weight, now - timestamp_ms, engine->cfg.ewma_half_life_ms);
+  double effective_weight = decay_since((double)weight, timestamp_ms, now,
+                                        engine->cfg.ewma_half_life_ms);
   if (forget_before_commit) {
     size_t forgotten =
         compact_prune(grp->pairs, now, engine->pair_options.forget_below);
@@ -1243,20 +1189,15 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
   size_t elevated = 0;
   for (size_t i = 0; i < event->count; i++) {
     prepared_item_t *item = &event->items[i];
-    /* Reservation has finished rehashing; these lookups/updates cannot
-     * allocate. */
-    bishfpm_rate_entry_t *entry =
-        rate_table_find(grp->item_rates, item->key, item->hash);
-    double ir = bishfpm_rate_update_weighted(
-        &entry->rate, now, engine->cfg.ewma_half_life_ms, effective_weight);
+    double ir = bishfpm_rate_update_weighted(&item->entry->rate, now,
+                                             engine->cfg.ewma_half_life_ms,
+                                             effective_weight);
     item->marginal = ir;
     double share = group_rate > 0 ? ir / group_rate : 0;
     if (ir >= engine->cfg.item_rate_threshold &&
         (engine->cfg.item_share_threshold <= 0 ||
          share >= engine->cfg.item_share_threshold)) {
       event->ids[elevated] = event->ids[i];
-      event->lengths[elevated] = item->length;
-      event->keys[elevated] = item->key;
       event->items[elevated++] = *item;
     }
   }
@@ -1280,18 +1221,21 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
           topk_result_t update =
               compact_add(grp->pairs, key, hash, effective_weight, now);
           if (candidate_promoted(&ctx, 2, update)) {
-            const char *items[] = {event->keys[i], event->keys[j]};
+            const char *pair_items[] = {event->items[i].key,
+                                        event->items[j].key};
             double marginals[] = {event->items[i].marginal,
                                   event->items[j].marginal};
-            notify_candidate(&ctx, items, 2, update, NULL, key, hash,
+            notify_candidate(&ctx, pair_items, 2, update, NULL, key, hash,
                              marginals);
           }
         }
     } else {
-      const char *items[BISHFPM_MAX_ITEMSET_ORDER];
+      const char *sub_items[BISHFPM_MAX_ITEMSET_ORDER];
+      double marginals[BISHFPM_MAX_ITEMSET_ORDER];
       char pattern[BISHFPM_MAX_PATTERN_LEN];
       for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
-        evaluate_combinations(&ctx, elevated, k, 0, 0, items, pattern, 0);
+        evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, marginals,
+                              pattern, 0);
     }
     result = ctx.triggered_count;
   }
@@ -1568,18 +1512,23 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
   size_t new_cap =
       next_pow2(survivors * 2 < INITIAL_GROUP_CAPACITY ? INITIAL_GROUP_CAPACITY
                                                        : survivors * 2);
-  if (!pruned && new_cap == engine->group_cap) {
-    for (size_t i = 0; i < engine->group_cap; i++) {
-      bishfpm_group_t *group = &engine->groups[i];
-      if (!group->group_key)
-        continue;
-      double gr = bishfpm_rate_query(&group->group_rate,
-                                     effective_time(now_ms, group->max_time_ms),
-                                     engine->cfg.ewma_half_life_ms);
-      prune_group(engine, group, now_ms, min_rate, gr);
+  if (new_cap == engine->group_cap) {
+    if (!pruned) {
+      for (size_t i = 0; i < engine->group_cap; i++) {
+        bishfpm_group_t *group = &engine->groups[i];
+        if (!group->group_key)
+          continue;
+        double gr = bishfpm_rate_query(
+            &group->group_rate, effective_time(now_ms, group->max_time_ms),
+            engine->cfg.ewma_half_life_ms);
+        prune_group(engine, group, now_ms, min_rate, gr);
+      }
+      engine->busy = false;
+      return 0;
     }
+    size_t removed = prune_groups_in_place(engine, now_ms, min_rate);
     engine->busy = false;
-    return 0;
+    return removed;
   }
   bishfpm_group_t *new_groups =
       new_cap && new_cap <= SIZE_MAX / sizeof(bishfpm_group_t)
@@ -1587,9 +1536,7 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
                           sizeof(bishfpm_group_t))
           : NULL;
   if (!new_groups) {
-    size_t removed = engine_budget(engine)
-                         ? prune_groups_in_place(engine, now_ms, min_rate)
-                         : 0;
+    size_t removed = prune_groups_in_place(engine, now_ms, min_rate);
     engine->busy = false;
     return removed;
   }
@@ -1708,7 +1655,7 @@ void bishfpm_get_stats(const bishfpm_t *engine, bishfpm_stats_t *out) {
         g->item_rates->capacity * sizeof(*g->item_rates->entries) +
         (g->arena ? sizeof(*g->arena) + (size_t)(g->arena->end - g->arena->base)
                   : 0) +
-        (g->cooldown_cap + g->cooldown_spare_cap) *
+        g->cooldown_cap *
             (cooldown_entry_size(g->pairs != NULL) + 2 * sizeof(uint32_t));
     if (g->pairs)
       out->memory_current_bytes +=

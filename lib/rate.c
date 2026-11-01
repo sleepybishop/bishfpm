@@ -6,8 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LN2 0.693147180559945309417
-
 bishfpm_rate_t *bishfpm_rate_new(void) {
   return calloc(1, sizeof(bishfpm_rate_t));
 }
@@ -35,7 +33,7 @@ double bishfpm_rate_decay(double current_rate, uint64_t delta_ms,
   }
   double half_lives = (double)delta_ms / half_life_ms;
   if (half_lives < -DBL_MIN_EXP || !isfinite(current_rate) || isnan(half_lives))
-    return current_rate * exp(-LN2 * half_lives);
+    return current_rate * exp2(-half_lives);
 
   /* A tiny multiplier can underflow before a large count is applied. Shift
    * the combined exponent instead, rounding only the final count to zero. */
@@ -183,12 +181,14 @@ double bishfpm_rate_table_update_weighted(bishfpm_rate_table_t *tbl,
     return 0;
   if (!weight)
     return bishfpm_rate_table_query(tbl, key, now_ms, half_life_ms);
-  /* Reservation owns all allocation/insertion rules, even for standalone use.
-   */
-  if (!bishfpm_rate_table_prepare(tbl, &key, 1))
-    return 0;
-  bishfpm_rate_entry_t *entry =
-      rate_table_find(tbl, key, bishfpm_hash_str(key, tbl->hash_seed));
+  uint64_t hash = bishfpm_hash_str(key, tbl->hash_seed);
+  bishfpm_rate_entry_t *entry = rate_table_find(tbl, key, hash);
+  if (!entry) {
+    /* reservation owns all allocation and insertion rules */
+    if (!bishfpm_rate_table_prepare(tbl, &key, 1))
+      return 0;
+    entry = rate_table_find(tbl, key, hash);
+  }
   return bishfpm_rate_update_weighted(&entry->rate, now_ms, half_life_ms,
                                       weight);
 }
@@ -278,22 +278,24 @@ size_t bishfpm_rate_table_prune(bishfpm_rate_table_t *tbl, uint64_t now_ms,
 
   /* calculate compacted capacity */
   size_t new_cap = next_pow2(survivors * 2 < 16 ? 16 : survivors * 2);
-  if (!removed && new_cap == tbl->capacity) {
-    for (size_t i = 0; i < tbl->capacity; i++) {
-      bishfpm_rate_entry_t *entry = &tbl->entries[i];
-      if (entry->key && now_ms >= entry->rate.last_time_ms) {
-        entry->rate.rate =
-            bishfpm_rate_query(&entry->rate, now_ms, half_life_ms);
-        entry->rate.last_time_ms = now_ms;
+  if (new_cap == tbl->capacity) {
+    if (!removed) {
+      for (size_t i = 0; i < tbl->capacity; i++) {
+        bishfpm_rate_entry_t *entry = &tbl->entries[i];
+        if (entry->key && now_ms >= entry->rate.last_time_ms) {
+          entry->rate.rate =
+              bishfpm_rate_query(&entry->rate, now_ms, half_life_ms);
+          entry->rate.last_time_ms = now_ms;
+        }
       }
+      return 0;
     }
-    return 0;
+    return prune_in_place(tbl, now_ms, half_life_ms, min_rate);
   }
   bishfpm_rate_entry_t *new_entries =
       memory_calloc(tbl->budget, new_cap, sizeof(bishfpm_rate_entry_t));
   if (!new_entries) {
-    return tbl->budget ? prune_in_place(tbl, now_ms, half_life_ms, min_rate)
-                       : 0;
+    return prune_in_place(tbl, now_ms, half_life_ms, min_rate);
   }
 
   size_t mask = new_cap - 1;

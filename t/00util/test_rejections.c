@@ -180,19 +180,16 @@ static void allocation_free_prune(void) {
   assert(bishfpm_prune(e, 0, .1) == 0);
   const char *a[] = {"a"};
   assert(bishfpm_add_event_weighted(e, "g", 1000, a, 1, 10, NULL, NULL) >= 0);
+  bishfpm_stats_t stats;
+  bishfpm_get_stats(e, &stats);
+  size_t before_bytes = stats.memory_current_bytes;
   fail_after = 0;
   assert(bishfpm_prune(e, 1000, 1) == 0);
   fail_after = SIZE_MAX;
   assert(bishfpm_pattern_rate(e, "g", "a\037b", 1000) == 0);
-  bishfpm_stats_t stats;
-  bishfpm_get_stats(e, &stats);
-  assert(stats.items_pruned ==
-         0); /* Marginal deletion still needs rehash storage. */
-  assert(bishfpm_group_rate(e, "g", 1000) == 10.5);
-  size_t before_bytes = stats.memory_current_bytes;
-  assert(bishfpm_prune(e, 1000, 1) == 0);
   bishfpm_get_stats(e, &stats);
   assert(stats.items_pruned == 1);
+  assert(bishfpm_group_rate(e, "g", 1000) == 10.5);
   assert(stats.memory_current_bytes == before_bytes - sizeof("b"));
   bishfpm_free(e);
 }
