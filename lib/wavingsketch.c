@@ -205,6 +205,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
   uint64_t dt = now - b->time;
   for (uint32_t i = 0; i < n; i++) {
     if (!cells[i].occupied) {
+      rates[i] = 0;
       if (empty == n)
         empty = i;
       continue;
