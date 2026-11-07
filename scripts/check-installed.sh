@@ -85,6 +85,8 @@ C
 cp examples/exact_store.c examples/exact_store.h examples/store_plugin.c "$stage/"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors -UNDEBUG \
   -I"$stage/usr/include" -I"$stage" -c "$stage/exact_store.c" -o "$stage/exact_store.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/heavykeeper.c -o "$stage/heavykeeper-backend.o"
 version=$(PKG_CONFIG_LIBDIR="$stage/usr/lib/pkgconfig" pkg-config --modversion bishfpm)
 run_compiler() {
   # CC/CXX are shell commands, as in make; keep consumer arguments positional.
@@ -124,6 +126,10 @@ for language in c c++; do
       -I"$stage/usr/include" -I"$stage" "$stage/store_plugin.c" \
       -x none "$stage/exact_store.o" "$library" -lm -o "$stage/plugin"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/plugin"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/heavykeeper.c \
+      -x none "$library" -lm -o "$stage/heavykeeper"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/heavykeeper"
   done
 done
 test ! -e "$stage/usr/include/internal.h"

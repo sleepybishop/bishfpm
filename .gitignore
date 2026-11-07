@@ -12,6 +12,7 @@ perf.data*
 build/
 examples/stream_tsv
 examples/store_plugin
+examples/heavykeeper
 t/00util/*
 !t/00util/*.c
 !t/00util/*.h

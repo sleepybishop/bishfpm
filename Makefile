@@ -16,6 +16,7 @@ CORE_OBJ = \
 	lib/compact.o \
 	lib/store.o \
 	lib/store_plugin.o \
+	lib/heavykeeper.o \
 	lib/bishfpm.o
 
 TEST_UTILS = \
@@ -38,7 +39,8 @@ TEST_UTILS = \
 	t/00util/test_general_fss \
 	t/00util/test_dynamic \
 	t/00util/test_pressure \
-	t/00util/test_store_plugin
+	t/00util/test_store_plugin \
+	t/00util/test_heavykeeper
 
 BENCH = \
 	t/00util/bench \
@@ -49,7 +51,8 @@ BENCH = \
 
 EXAMPLES = \
 	examples/stream_tsv \
-	examples/store_plugin
+	examples/store_plugin \
+	examples/heavykeeper
 
 all: libraries $(TEST_UTILS) $(BENCH) $(EXAMPLES)
 
@@ -81,6 +84,9 @@ t/00util/bench_engines: t/00util/bench_engines.c t/00util/store_twins.c t/00util
 t/00util/test_store_plugin: t/00util/test_store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
 
+t/00util/test_heavykeeper: t/00util/test_heavykeeper.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
 examples/store_plugin: examples/store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@
 
@@ -95,7 +101,7 @@ examples/%: examples/%.c libbishfpm.a
 -include $(patsubst %,%.d,$(BENCH))
 -include $(patsubst %,%.d,$(EXAMPLES))
 
-test: $(TEST_UTILS) $(EXAMPLES) t/00util/bench_general t/00util/bench_engines
+test: t/00util/heavykeeper_trace $(TEST_UTILS) $(EXAMPLES) t/00util/bench_general t/00util/bench_engines
 	prove -I. -v t/*.t
 
 check: test
@@ -116,7 +122,7 @@ indent:
 	clang-format -style=LLVM -i include/*.h lib/*.c lib/*.h t/00util/*.c t/00util/*.h examples/*.c examples/*.h t/fuzz_stream.c
 
 clean:
-	$(RM) lib/*.o lib/*.d t/00util/*.o t/00util/*.d examples/*.o examples/*.d *.o *.a *.d libbishfpm.so* bishfpm.pc $(TEST_UTILS) $(BENCH) $(EXAMPLES)
+	$(RM) lib/*.o lib/*.d t/00util/*.o t/00util/*.d examples/*.o examples/*.d *.o *.a *.d libbishfpm.so* bishfpm.pc $(TEST_UTILS) t/00util/heavykeeper_trace $(BENCH) $(EXAMPLES)
 
 .PHONY: all test check bench scan indent clean
 
