@@ -2,204 +2,19 @@
 #include "bishfpm_rate.h"
 #include "bishfpm_topk.h"
 #include "internal.h"
+#define PLUGIN_STORE_T bishfpm_topk_t
+#define PLUGIN_ENTRY_T bishfpm_heap_entry_t
+#define PLUGIN_SLOT_T bishfpm_slot_entry_t
+#define PLUGIN_SLOTS(s) ((s)->slot_map_cap)
+#define PLUGIN_HALF_LIFE(s) ((s)->half_life_ms)
+#define PLUGIN_NO_PRUNE 1
+#include "plugin_common.h"
 #include <float.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static inline void copy_heap_entry(bishfpm_heap_entry_t *dst,
-                                   const bishfpm_heap_entry_t *src) {
-  memcpy(dst, src, offsetof(bishfpm_heap_entry_t, pattern) + src->length + 1);
-}
-
-/* find slot in hash map */
-static int slot_map_find(const bishfpm_topk_t *topk, const char *pattern,
-                         size_t length, uint64_t hash, uint32_t *out_idx) {
-  size_t mask = topk->slot_map_cap - 1;
-  size_t idx = (size_t)(hash & mask);
-
-  for (size_t i = 0; i < topk->slot_map_cap; i++) {
-    size_t s = (idx + i) & mask;
-    if (!topk->slot_map[s].occupied) {
-      return 0;
-    }
-    if (topk->slot_map[s].hash == hash) {
-      uint32_t h_idx = topk->slot_map[s].heap_idx;
-      if (topk->heap[h_idx].length == length &&
-          memcmp(topk->heap[h_idx].pattern, pattern, length) == 0) {
-        if (out_idx) {
-          *out_idx = h_idx;
-        }
-        return 1;
-      }
-    }
-  }
-  return 0;
-}
-
-/* set slot in hash map */
-static void slot_map_set(bishfpm_topk_t *topk, uint64_t hash,
-                         uint32_t heap_idx) {
-  size_t mask = topk->slot_map_cap - 1;
-  size_t idx = (size_t)(hash & mask);
-
-  for (size_t i = 0; i < topk->slot_map_cap; i++) {
-    size_t s = (idx + i) & mask;
-    if (!topk->slot_map[s].occupied) {
-      topk->slot_map[s].hash = hash;
-      topk->slot_map[s].heap_idx = heap_idx;
-      topk->slot_map[s].occupied = true;
-      return;
-    }
-  }
-}
-
-/* remove slot from hash map using backward shift */
-static void slot_map_remove(bishfpm_topk_t *topk, uint64_t hash,
-                            uint32_t heap_idx) {
-  size_t mask = topk->slot_map_cap - 1;
-  size_t idx = (size_t)(hash & mask);
-  size_t s = idx;
-
-  for (size_t i = 0; i < topk->slot_map_cap; i++) {
-    s = (idx + i) & mask;
-    if (!topk->slot_map[s].occupied) {
-      return;
-    }
-    if (topk->slot_map[s].hash == hash &&
-        topk->slot_map[s].heap_idx == heap_idx) {
-      break;
-    }
-  }
-
-  if (!topk->slot_map[s].occupied || topk->slot_map[s].hash != hash ||
-      topk->slot_map[s].heap_idx != heap_idx) {
-    return;
-  }
-
-  /* backward shift deletion */
-  size_t j = s;
-  for (size_t i = 1; i < topk->slot_map_cap; i++) {
-    size_t k = (s + i) & mask;
-    if (!topk->slot_map[k].occupied) {
-      break;
-    }
-    size_t orig = (size_t)(topk->slot_map[k].hash & mask);
-    bool can_move = false;
-    if (j <= k) {
-      can_move = (orig <= j || orig > k);
-    } else {
-      can_move = (orig <= j && orig > k);
-    }
-    if (can_move) {
-      topk->slot_map[j] = topk->slot_map[k];
-      j = k;
-    }
-  }
-  topk->slot_map[j].occupied = false;
-  topk->slot_map[j].hash = 0;
-  topk->slot_map[j].heap_idx = 0;
-}
-
-/* Locate by old heap position as well as hash, before either item moves. */
-static size_t slot_for_index(const bishfpm_topk_t *topk, uint32_t index) {
-  size_t slot = topk->heap[index].hash & (topk->slot_map_cap - 1);
-  while (!topk->slot_map[slot].occupied ||
-         topk->slot_map[slot].heap_idx != index)
-    slot = (slot + 1) & (topk->slot_map_cap - 1);
-  return slot;
-}
-
-static void slot_map_rebuild(bishfpm_topk_t *topk) {
-  memset(topk->slot_map, 0, topk->slot_map_cap * sizeof(*topk->slot_map));
-  for (uint32_t i = 0; i < topk->heap_size; i++)
-    slot_map_set(topk, topk->heap[i].hash, i);
-}
-
-/* Compute a counter at the common heap time. */
-static inline double item_rate(const bishfpm_heap_entry_t *item,
-                               uint64_t now_ms, double half_life_ms) {
-  return decay_since(item->rate, item->last_time_ms, now_ms, half_life_ms);
-}
-
-/* sift up in min-heap */
-static void heapify_up(bishfpm_topk_t *topk, uint32_t idx, uint64_t now_ms) {
-  if (idx == 0)
-    return;
-  uint32_t parent = (idx - 1) / 2;
-  double rate = item_rate(&topk->heap[idx], now_ms, topk->half_life_ms);
-  if (!(rate < item_rate(&topk->heap[parent], now_ms, topk->half_life_ms)))
-    return;
-  bishfpm_heap_entry_t held;
-  copy_heap_entry(&held, &topk->heap[idx]);
-  size_t held_slot = slot_for_index(topk, idx);
-  uint32_t hole = idx;
-  for (;;) {
-    size_t slot = slot_for_index(topk, parent);
-    copy_heap_entry(&topk->heap[hole], &topk->heap[parent]);
-    topk->slot_map[slot].heap_idx = hole;
-    hole = parent;
-    if (hole == 0)
-      break;
-    parent = (hole - 1) / 2;
-    if (!(rate < item_rate(&topk->heap[parent], now_ms, topk->half_life_ms)))
-      break;
-  }
-  copy_heap_entry(&topk->heap[hole], &held);
-  topk->slot_map[held_slot].heap_idx = hole;
-}
-
-/* sift down in min-heap */
-static void heapify_down(bishfpm_topk_t *topk, uint32_t idx, uint64_t now_ms) {
-  uint32_t child = 2 * idx + 1;
-  if (child >= topk->heap_size)
-    return;
-  double held_rate = item_rate(&topk->heap[idx], now_ms, topk->half_life_ms);
-  double child_rate = item_rate(&topk->heap[child], now_ms, topk->half_life_ms);
-  if (child + 1 < topk->heap_size) {
-    double right_rate =
-        item_rate(&topk->heap[child + 1], now_ms, topk->half_life_ms);
-    if (right_rate < child_rate) {
-      child++;
-      child_rate = right_rate;
-    }
-  }
-  /* Most resident updates do not move. Avoid copying the pattern buffer
-   * or probing its map slot until the first strict comparison requires it. */
-  if (!(child_rate < held_rate))
-    return;
-  /* Carry the updated entry through a hole instead of swapping two complete
-   * pattern buffers at every level. Probe chains do not change, only indices.
-   * Strict comparisons retain the existing tie and enumeration behavior. */
-  bishfpm_heap_entry_t held;
-  copy_heap_entry(&held, &topk->heap[idx]);
-  size_t held_slot = slot_for_index(topk, idx);
-  uint32_t hole = idx;
-  for (;;) {
-    size_t child_slot = slot_for_index(topk, child);
-    copy_heap_entry(&topk->heap[hole], &topk->heap[child]);
-    topk->slot_map[child_slot].heap_idx = hole;
-    hole = child;
-    child = 2 * hole + 1;
-    if (child >= topk->heap_size)
-      break;
-    child_rate = item_rate(&topk->heap[child], now_ms, topk->half_life_ms);
-    if (child + 1 < topk->heap_size) {
-      double right_rate =
-          item_rate(&topk->heap[child + 1], now_ms, topk->half_life_ms);
-      if (right_rate < child_rate) {
-        child++;
-        child_rate = right_rate;
-      }
-    }
-    if (!(child_rate < held_rate))
-      break;
-  }
-  copy_heap_entry(&topk->heap[hole], &held);
-  topk->slot_map[held_slot].heap_idx = hole;
-}
 
 static void topk_init(bishfpm_topk_t *topk, uint32_t k, double half_life_ms,
                       size_t slot_cap, bool arena_backed) {
@@ -378,18 +193,16 @@ static topk_result_t fss_add(bishfpm_topk_t *t, const char *pattern,
   }
   if (full) {
     sketch_record(t, t->heap[0].hash, minimum, now);
-    slot_map_remove(t, t->heap[0].hash, 0);
+    slot_map_remove(t, 0);
     idx = 0;
   } else {
     idx = t->heap_size++;
   }
   bishfpm_heap_entry_t *entry = &t->heap[idx];
-  entry->hash = hash;
+  entry_identity(entry, pattern, length, hash);
   entry->rate = error + weight;
   entry->error = error;
   entry->last_time_ms = now;
-  entry->length = (uint16_t)length;
-  memcpy(entry->pattern, pattern, length + 1);
   slot_map_set(t, hash, idx);
   r.present = true;
   r.replaced = full;
@@ -469,15 +282,13 @@ topk_result_t topk_add_sized(bishfpm_topk_t *topk, const char *pattern,
     idx = topk->heap_size++;
   } else {
     idx = 0;
-    slot_map_remove(topk, topk->heap[0].hash, 0);
+    slot_map_remove(topk, 0);
   }
   bishfpm_heap_entry_t *item = &topk->heap[idx];
-  item->hash = hash;
+  entry_identity(item, pattern, length, hash);
   item->rate = error + weight;
   item->error = error;
   item->last_time_ms = now_ms;
-  item->length = (uint16_t)length;
-  memcpy(item->pattern, pattern, length + 1);
   result.present = true;
   result.replaced = replacing;
   result.upper = item->rate;
@@ -605,7 +416,7 @@ size_t bishfpm_topk_prune(bishfpm_topk_t *topk, uint64_t now_ms,
       /* move last element into this position */
       uint32_t last = topk->heap_size - 1;
       if (i != last) {
-        copy_heap_entry(&topk->heap[i], &topk->heap[last]);
+        copy_entry(&topk->heap[i], &topk->heap[last]);
       }
       topk->heap_size--;
       pruned++;

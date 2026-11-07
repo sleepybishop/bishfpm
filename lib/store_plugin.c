@@ -101,14 +101,21 @@ bool store_extension_init(store_extension_t *x, bishfpm_memory_budget_t *budget,
                           size_t size) {
   x->budget = budget;
   x->bytes = 0;
-  x->limit = budget ? SIZE_MAX : x->plan.engine_peak_bytes;
+  x->limit = x->plan.engine_peak_bytes;
   x->config = NULL;
   x->host = (bishfpm_store_host_t){x, host_allocate, host_zeroed, host_release};
-  if (!x->descriptor.clone_config(&x->host, c, raw, size, &x->config))
+  if (!x->descriptor.clone_config(&x->host, c, raw, size, &x->config)) {
+    assert(x->bytes == 0);
     return false;
-  if (!budget)
-    x->limit = x->plan.engine_peak_bytes +
-               (size_t)c->max_groups * x->plan.group_peak_bytes;
+  }
+  size_t groups_bytes;
+  if (x->plan.engine_peak_bytes != SIZE_MAX &&
+      x->plan.group_peak_bytes != SIZE_MAX &&
+      size_mul((size_t)c->max_groups, x->plan.group_peak_bytes,
+               &groups_bytes) &&
+      size_add(x->plan.engine_peak_bytes, groups_bytes, &x->limit))
+    return true;
+  x->limit = SIZE_MAX;
   return true;
 }
 static bool extension_validate(const store_config_t *c) {
@@ -121,11 +128,18 @@ static size_t extension_bytes(const store_config_t *c) {
 static bool extension_create(store_t *s, bishfpm_memory_budget_t *budget) {
   (void)budget;
   store_extension_t *x = s->config->extension;
+  size_t saved = x->limit, group_limit;
+  if (x->plan.group_peak_bytes != SIZE_MAX &&
+      size_add(x->bytes, x->plan.group_peak_bytes, &group_limit) &&
+      group_limit < x->limit)
+    x->limit = group_limit;
   void *state = NULL;
-  if (!x->descriptor.create(&x->host, x->config, &state))
+  bool ok = x->descriptor.create(&x->host, x->config, &state) && state != NULL;
+  x->limit = saved;
+  if (!ok)
     return false;
   s->state.extension = state;
-  return state != NULL;
+  return true;
 }
 static void extension_destroy(store_t *s) {
   store_extension_t *x = s->config->extension;
@@ -190,8 +204,9 @@ static store_result_t extension_result(const store_extension_t *x,
     if (heuristic_valid(x, r)) {
       count.present = r.resident;
       count.upper = r.upper; /* raw query estimate with known=false */
-      if (x->descriptor.capabilities & BISHFPM_STORE_ALERT_EVIDENCE)
-        count.lower = r.lower; /* internal subset evidence, not public bounds */
+      count.lower = x->descriptor.capabilities & BISHFPM_STORE_ALERT_EVIDENCE
+                        ? r.lower
+                        : r.upper;
     }
     count.error = INFINITY;
     return (store_result_t){count, false};
@@ -229,23 +244,40 @@ static store_snapshot_t extension_snapshot(const store_t *s) {
   /* host charges, aggregated once per engine, are authoritative for bytes */
   return (store_snapshot_t){snap.resident_patterns, snap.resident_capacity, 0};
 }
-const store_ops_t store_extension_text_ops = {false,
-                                              extension_validate,
-                                              extension_bytes,
-                                              extension_create,
-                                              extension_destroy,
-                                              extension_query_text,
-                                              NULL,
-                                              extension_prune,
-                                              NULL,
-                                              extension_snapshot};
-const store_ops_t store_extension_pair_ops = {true,
-                                              extension_validate,
-                                              extension_bytes,
-                                              extension_create,
-                                              extension_destroy,
-                                              NULL,
-                                              extension_query_pair,
-                                              extension_prune,
-                                              extension_prune_bounded,
-                                              extension_snapshot};
+static const store_ops_t store_extension_text_ops = {false,
+                                                     extension_validate,
+                                                     extension_bytes,
+                                                     extension_create,
+                                                     extension_destroy,
+                                                     extension_query_text,
+                                                     NULL,
+                                                     extension_prune,
+                                                     NULL,
+                                                     extension_snapshot};
+static const store_ops_t store_extension_pair_ops = {true,
+                                                     extension_validate,
+                                                     extension_bytes,
+                                                     extension_create,
+                                                     extension_destroy,
+                                                     NULL,
+                                                     extension_query_pair,
+                                                     extension_prune,
+                                                     NULL,
+                                                     extension_snapshot};
+static const store_ops_t store_extension_pair_bounded_ops = {
+    true,
+    extension_validate,
+    extension_bytes,
+    extension_create,
+    extension_destroy,
+    NULL,
+    extension_query_pair,
+    extension_prune,
+    extension_prune_bounded,
+    extension_snapshot};
+const store_ops_t *store_extension_ops(const store_extension_t *x) {
+  if (x->descriptor.representation != BISHFPM_STORE_PAIR64)
+    return &store_extension_text_ops;
+  return x->descriptor.prune_bounded ? &store_extension_pair_bounded_ops
+                                     : &store_extension_pair_ops;
+}

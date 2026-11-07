@@ -3,43 +3,12 @@
 
 #include "bishfpm_hash.h"
 #include "bishfpm_itemset.h"
+#include "plugin_common.h"
 #include "state.h"
 #include <assert.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
-static inline uint64_t effective_time(uint64_t requested, uint64_t watermark) {
-  return requested > watermark ? requested : watermark;
-}
-
-static inline double decay_since(double count, uint64_t then, uint64_t now,
-                                 double half) {
-  return now <= then ? count : bishfpm_rate_decay(count, now - then, half);
-}
-
-static inline size_t next_pow2(size_t v) {
-  if (v > (SIZE_MAX >> 1))
-    return 0;
-  size_t p = 16;
-  while (p < v)
-    p <<= 1;
-  return p;
-}
-
-static inline bool size_add(size_t a, size_t b, size_t *out) {
-  if (b > SIZE_MAX - a)
-    return false;
-  *out = a + b;
-  return true;
-}
-
-static inline bool size_mul(size_t a, size_t b, size_t *out) {
-  if (a && b > SIZE_MAX / a)
-    return false;
-  *out = a * b;
-  return true;
-}
 
 /* NULL budgets preserve the standalone and conservative allocation paths.
  * No allocation headers: charges are exactly the requested payload sizes. */

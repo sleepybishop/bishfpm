@@ -97,6 +97,10 @@ static int create(const bishfpm_store_host_t *h, const void *raw, void **out) {
 static bishfpm_store_count_t query_key(const void *raw, plugin_key_t key,
                                        size_t length, uint64_t hash,
                                        uint64_t now) {
+#ifndef BISHFPM_USS_PAIR64
+  if (!valid_text_key(key, length))
+    return (bishfpm_store_count_t){0, 0, 0, 0, BISHFPM_UPDATE_ZERO, 0};
+#endif
   const uss_store_t *s = raw;
   now = effective_time(now, s->max_time_ms);
   uint32_t idx;
@@ -114,6 +118,12 @@ static bishfpm_store_count_t query_key(const void *raw, plugin_key_t key,
 static bishfpm_store_count_t update_key(void *raw, plugin_key_t pattern,
                                         size_t length, uint64_t hash,
                                         double weight, uint64_t now) {
+#ifndef BISHFPM_USS_PAIR64
+  if (!valid_text_key(pattern, length))
+    return (bishfpm_store_count_t){
+        0, 0, 0, 0, weight == 0 ? BISHFPM_UPDATE_ZERO : BISHFPM_UPDATE_REJECTED,
+        0};
+#endif
   uss_store_t *s = raw;
   now = effective_time(now, s->max_time_ms);
   if (!weight)
@@ -222,10 +232,10 @@ const bishfpm_store_descriptor_t bishfpm_uss_store = {
     destroy_config,
     create,
     destroy,
-    prepare,
-    complete,
-    complete,
-    complete,
+    plugin_prepare,
+    plugin_complete,
+    plugin_complete,
+    plugin_complete,
 #ifdef BISHFPM_USS_PAIR64
     NULL,
     update_pair,

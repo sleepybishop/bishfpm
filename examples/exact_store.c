@@ -104,9 +104,11 @@ static void destroy(const bishfpm_store_host_t *h, void *raw) {
              sizeof(*s) +
                  (size_t)s->config->options.capacity * sizeof(entry_t));
 }
-static size_t find(const state_t *s, const char *text, uint64_t pair) {
+static size_t find(const state_t *s, const char *text, size_t length,
+                   uint64_t pair) {
   for (size_t i = 0; i < s->count; i++)
-    if (text ? strcmp(s->entries[i].text, text) == 0
+    if (text ? (strlen(s->entries[i].text) == length &&
+                memcmp(s->entries[i].text, text, length) == 0)
              : s->entries[i].pair == pair)
       return i;
   return s->count;
@@ -119,7 +121,7 @@ static size_t missing_text(const state_t *s, const bishfpm_store_event_t *e,
                            size_t length) {
   if (depth == order) {
     text[length] = 0;
-    return find(s, text, 0) == s->count;
+    return find(s, text, length, 0) == s->count;
   }
   size_t missing = 0;
   for (size_t i = start; i + order - depth <= e->count; i++) {
@@ -140,7 +142,7 @@ static int prepare(void *raw, const bishfpm_store_event_t *e, void **token) {
     if (s->config->options.representation == BISHFPM_STORE_PAIR64) {
       for (size_t i = 0; i < e->count; i++)
         for (size_t j = i + 1; j < e->count; j++)
-          missing += find(s, NULL, pack(e->ids[i], e->ids[j])) == s->count;
+          missing += find(s, NULL, 0, pack(e->ids[i], e->ids[j])) == s->count;
     } else {
       char text[BISHFPM_MAX_PATTERN_LEN];
       for (size_t k = e->min_order; k <= e->max_order && k <= e->count; k++)
@@ -182,8 +184,8 @@ static double value(const state_t *s, const entry_t *e, uint64_t now) {
          exp2(-(double)(now > e->time ? now - e->time : 0) / s->config->half);
 }
 static bishfpm_store_count_t query(const state_t *s, const char *text,
-                                   uint64_t pair, uint64_t now) {
-  size_t i = find(s, text, pair);
+                                   size_t length, uint64_t pair, uint64_t now) {
+  size_t i = find(s, text, length, pair);
   double count = i == s->count ? 0 : value(s, &s->entries[i], now);
   bishfpm_store_count_t result = {
       count, count, i != s->count, 1, BISHFPM_UPDATE_ZERO, 0};
@@ -193,11 +195,13 @@ static bishfpm_store_count_t update(state_t *s, const char *text, size_t length,
                                     uint64_t pair, double weight,
                                     uint64_t now) {
   if (!weight)
-    return query(s, text, pair, now);
-  size_t i = find(s, text, pair);
+    return query(s, text, length, pair, now);
+  if (!(weight > 0))
+    return (bishfpm_store_count_t){0, 0, 0, 0, BISHFPM_UPDATE_REJECTED, 0};
+  size_t i = find(s, text, length, pair);
   double before = i == s->count ? 0 : value(s, &s->entries[i], now);
   if (weight > DBL_MAX - before) {
-    bishfpm_store_count_t r = query(s, text, pair, now);
+    bishfpm_store_count_t r = query(s, text, length, pair, now);
     r.outcome = BISHFPM_UPDATE_REJECTED;
     return r;
   }
@@ -222,6 +226,9 @@ static bishfpm_store_count_t update_text(void *s, const char *key, size_t n,
                                          uint64_t hash, double w,
                                          uint64_t now) {
   (void)hash;
+  if (!key || !n || n >= BISHFPM_MAX_PATTERN_LEN || !key[0])
+    return (bishfpm_store_count_t){
+        0, 0, 0, 0, w == 0 ? BISHFPM_UPDATE_ZERO : BISHFPM_UPDATE_REJECTED, 0};
   return update(s, key, n, 0, w, now);
 }
 static bishfpm_store_count_t update_pair(void *s, uint64_t key, uint64_t hash,
@@ -231,14 +238,15 @@ static bishfpm_store_count_t update_pair(void *s, uint64_t key, uint64_t hash,
 }
 static bishfpm_store_count_t query_text(const void *s, const char *key,
                                         size_t n, uint64_t hash, uint64_t now) {
-  (void)n;
   (void)hash;
-  return query(s, key, 0, now);
+  if (!key || !n || n >= BISHFPM_MAX_PATTERN_LEN || !key[0])
+    return (bishfpm_store_count_t){0, 0, 0, 0, BISHFPM_UPDATE_ZERO, 0};
+  return query(s, key, n, 0, now);
 }
 static bishfpm_store_count_t query_pair(const void *s, uint64_t key,
                                         uint64_t hash, uint64_t now) {
   (void)hash;
-  return query(s, NULL, key, now);
+  return query(s, NULL, 0, key, now);
 }
 static size_t prune(void *s, uint64_t now, double cutoff) {
   (void)s;

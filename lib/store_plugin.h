@@ -11,8 +11,8 @@ typedef struct {
   size_t bytes, limit;
   bishfpm_memory_budget_t *budget;
 } store_extension_t;
-BISHFPM_PRIVATE extern const store_ops_t store_extension_text_ops,
-    store_extension_pair_ops;
+BISHFPM_PRIVATE const store_ops_t *
+store_extension_ops(const store_extension_t *);
 BISHFPM_PRIVATE bool store_extension_validate(
     const bishfpm_store_descriptor_t *, const bishfpm_store_engine_options_t *,
     const bishfpm_config_t *, const void *, size_t, store_extension_t *);

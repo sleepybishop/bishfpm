@@ -294,11 +294,9 @@ static bishfpm_t *create_internal(const bishfpm_config_t *cfg,
   }
 
   store_config_t selected = {0};
-  selected.ops = pairs ? &store_pair_ops : &store_text_ops;
-  if (extension)
-    selected.ops = extension->descriptor.representation == BISHFPM_STORE_PAIR64
-                       ? &store_extension_pair_ops
-                       : &store_extension_text_ops;
+  selected.ops = extension ? store_extension_ops(extension)
+                 : pairs   ? &store_pair_ops
+                           : &store_text_ops;
   selected.extension = extension;
   selected.mining = &c;
   selected.sketch_width = o.sketch_width;
@@ -771,17 +769,7 @@ static bool is_pattern_subset(const char *sub_pattern,
 /* check if candidate is subsumed by an active subset trigger */
 static inline double store_query_lower(const bishfpm_group_t *g,
                                        const char *key, uint64_t now) {
-  if (g->store.config->extension) {
-    store_result_t r = g->store.config->ops->query_text(&g->store, key, now);
-    const store_extension_t *x = g->store.config->extension;
-    if (x->descriptor.capabilities & BISHFPM_STORE_ALERT_EVIDENCE)
-      return r.count.lower;
-    return x->descriptor.capabilities & BISHFPM_STORE_HEURISTIC_ESTIMATES
-               ? r.count.upper
-           : r.known ? r.count.lower
-                     : 0;
-  }
-  return bishfpm_topk_query_lower(g->store.state.text, key, now);
+  return g->store.config->ops->query_text(&g->store, key, now).count.lower;
 }
 static bool is_candidate_subsumed(bishfpm_group_t *grp,
                                   const char *const *subset_items,
@@ -996,23 +984,59 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
   }
 }
 
-static topk_result_t extension_update_text(bishfpm_eval_ctx_t *ctx,
-                                           const char *key, size_t length) {
-  uint64_t hash = bishfpm_murmur3_64(key, length, ctx->engine->cfg.hash_seed);
-  return store_extension_update_count(
-      ctx->engine->store_config.extension,
-      ctx->update_text(ctx->grp->store.state.extension, key, length, hash,
-                       ctx->weight, ctx->timestamp_ms),
-      hash);
+/* inputs and all possible subset lengths were validated by prepare_event;
+ * append each prefix once per order, preserving lexicographic enumeration */
+static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
+                                  size_t target, size_t start, size_t depth,
+                                  const char **items, double *marginals,
+                                  char *pattern, size_t length) {
+  if (depth == target) {
+    pattern[length] = 0;
+    topk_result_t update;
+    if (ctx->update_text) {
+      uint64_t hash =
+          bishfpm_murmur3_64(pattern, length, ctx->engine->cfg.hash_seed);
+      update = store_extension_update_count(
+          ctx->engine->store_config.extension,
+          ctx->update_text(ctx->grp->store.state.extension, pattern, length,
+                           hash, ctx->weight, ctx->timestamp_ms),
+          hash);
+    } else {
+      update = topk_add_sized(ctx->grp->store.state.text, pattern, length,
+                              ctx->weight, ctx->timestamp_ms);
+      bishfpm_pattern_pressure_t *p = &ctx->grp->pressure;
+      p->candidates_evaluated++;
+      if (ctx->weight == 0)
+        p->zero_weight_queries++;
+      else if (!update.accepted)
+        p->rejected_updates++;
+      else if (update.was_present)
+        p->resident_updates++;
+      else if (update.present)
+        p->admissions++;
+      else
+        p->filtered_updates++;
+      p->replacements += update.replaced;
+    }
+    if (candidate_promoted(ctx, depth, update))
+      notify_candidate(ctx, items, NULL, depth, update, pattern, length, 0,
+                       update.hash, marginals);
+    return;
+  }
+  size_t needed = target - depth;
+  for (size_t i = start; i + needed <= count; i++) {
+    size_t pos = length;
+    if (depth)
+      pattern[pos++] = BISHFPM_ITEM_DELIM;
+    const prepared_item_t *item = &ctx->event->items[i];
+    size_t item_length = item->length;
+    items[depth] = item->key;
+    marginals[depth] = item->marginal;
+    memcpy(pattern + pos, item->key, item_length);
+    evaluate_combinations(ctx, count, target, i + 1, depth + 1, items,
+                          marginals, pattern, pos + item_length);
+  }
 }
-#define EVALUATE_COMBINATIONS evaluate_combinations
-#define UPDATE_TEXT(ctx, key, len)                                             \
-  topk_add_sized((ctx)->grp->store.state.text, (key), (len), (ctx)->weight,    \
-                 (ctx)->timestamp_ms)
-#include "evaluate_text.h"
-#define EVALUATE_COMBINATIONS evaluate_extension_combinations
-#define UPDATE_TEXT(ctx, key, len) extension_update_text((ctx), (key), (len))
-#include "evaluate_text.h"
 static int compare_lengths(const void *a, const void *b) {
   size_t x = *(const size_t *)a, y = *(const size_t *)b;
   return (x < y) - (x > y);
@@ -1185,6 +1209,7 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     goto finalize;
   }
   if (missing_marginals) {
+    size_t old_cap = grp->item_rates->capacity;
     rate_prepare_result_t reservation =
         rate_table_prepare_result(grp->item_rates, event->keys, event->count);
     if (reservation != RATE_PREPARED) {
@@ -1198,9 +1223,11 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
       budget_rejection = reservation == RATE_LIMIT;
       goto finalize;
     }
+    bool rehashed = grp->item_rates->capacity != old_cap;
     for (size_t i = 0; i < event->count; i++) {
-      event->items[i].entry = rate_table_find(
-          grp->item_rates, event->items[i].key, event->items[i].hash);
+      if (rehashed || !event->items[i].entry)
+        event->items[i].entry = rate_table_find(
+            grp->item_rates, event->items[i].key, event->items[i].hash);
     }
   }
 
@@ -1227,7 +1254,8 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     if (ir >= engine->cfg.item_rate_threshold &&
         (engine->cfg.item_share_threshold <= 0 ||
          share >= engine->cfg.item_share_threshold)) {
-      event->ids[elevated] = event->ids[i];
+      if (engine->numeric_pairs)
+        event->ids[elevated] = event->ids[i];
       event->items[elevated++] = *item;
     }
   }
@@ -1258,34 +1286,36 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
      * finish before the next candidate; callbacks can query this exact state.
      */
     if (engine->numeric_pairs) {
-      if (engine->store_config.extension) {
-        store_extension_t *x = engine->store_config.extension;
-        bishfpm_store_count_t (*update_pair)(void *, uint64_t, uint64_t, double,
-                                             uint64_t) =
-            x->descriptor.update_pair;
-        void *state = grp->store.state.extension;
-#define UPDATE_PAIR(key, hash)                                                 \
-  store_extension_update_count(                                                \
-      x, update_pair(state, (key), (hash), effective_weight, now), (hash))
-#include "evaluate_pair.h"
-      } else {
-#define UPDATE_PAIR(key, hash)                                                 \
-  compact_add(grp->store.state.pairs, (key), (hash), effective_weight, now)
-#include "evaluate_pair.h"
-      }
+      store_extension_t *x = engine->store_config.extension;
+      for (size_t i = 0; i < elevated; i++)
+        for (size_t j = i + 1; j < elevated; j++) {
+          uint64_t key = compact_key(event->ids[i], event->ids[j]);
+          uint64_t hash = compact_hash(key);
+          topk_result_t update =
+              x ? store_extension_update_count(
+                      x,
+                      x->descriptor.update_pair(grp->store.state.extension, key,
+                                                hash, effective_weight, now),
+                      hash)
+                : compact_add(grp->store.state.pairs, key, hash,
+                              effective_weight, now);
+          if (candidate_promoted(&ctx, 2, update)) {
+            const char *pair_items[] = {event->items[i].key,
+                                        event->items[j].key};
+            size_t lengths[] = {event->items[i].length, event->items[j].length};
+            double marginals[] = {event->items[i].marginal,
+                                  event->items[j].marginal};
+            notify_candidate(&ctx, pair_items, lengths, 2, update, NULL, 0, key,
+                             hash, marginals);
+          }
+        }
     } else {
       const char *sub_items[BISHFPM_MAX_ITEMSET_ORDER];
       double marginals[BISHFPM_MAX_ITEMSET_ORDER];
       char pattern[BISHFPM_MAX_PATTERN_LEN];
-      if (engine->store_config.extension) {
-        for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
-          evaluate_extension_combinations(&ctx, elevated, k, 0, 0, sub_items,
-                                          marginals, pattern, 0);
-      } else {
-        for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
-          evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, marginals,
-                                pattern, 0);
-      }
+      for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
+        evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, marginals,
+                              pattern, 0);
     }
     result = ctx.triggered_count;
   }
@@ -1394,14 +1424,10 @@ int bishfpm_pattern_bounds(bishfpm_t *engine, const char *name,
   store_result_t r;
   if (!out || !query_pattern(engine, name, pattern, now, &r))
     return 0;
-  bool heuristic = engine->store_config.extension &&
-                   (((store_extension_t *)engine->store_config.extension)
-                        ->descriptor.capabilities &
-                    BISHFPM_STORE_HEURISTIC_ESTIMATES);
-  *out =
-      (bishfpm_count_bounds_t){heuristic && !r.known ? 0 : r.count.lower,
-                               heuristic && !r.known ? INFINITY : r.count.upper,
-                               r.count.present, r.known};
+  bool heuristic = isinf(r.count.error);
+  *out = (bishfpm_count_bounds_t){heuristic ? 0 : r.count.lower,
+                                  heuristic ? INFINITY : r.count.upper,
+                                  r.count.present, r.known};
   return 1;
 }
 
@@ -1455,10 +1481,7 @@ static size_t prune_numeric_marginals(bishfpm_rate_table_t *table, uint64_t now,
 size_t bishfpm_prune_pairs(bishfpm_t *engine, const char *group_key,
                            uint64_t now_ms, size_t max_pairs) {
   if (!engine || !group_key || !max_pairs || engine->busy ||
-      !engine->numeric_pairs || !engine->store_config.ops->prune_bounded ||
-      (engine->store_config.extension &&
-       !((store_extension_t *)engine->store_config.extension)
-            ->descriptor.prune_bounded))
+      !engine->numeric_pairs || !engine->store_config.ops->prune_bounded)
     return 0;
   bishfpm_group_t *group = find_group(engine, group_key, NULL);
   if (!group)

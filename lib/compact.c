@@ -53,52 +53,6 @@ static void slot_map_set(compact_t *store, uint64_t hash, uint32_t heap_idx) {
   }
 }
 
-static void slot_map_remove(compact_t *store, uint64_t hash,
-                            uint32_t heap_idx) {
-  size_t mask = store->slot_map_cap - 1;
-  size_t idx = (size_t)(hash & mask);
-  size_t s = idx;
-
-  for (size_t i = 0; i < store->slot_map_cap; i++) {
-    s = (idx + i) & mask;
-    if (!store->slot_map[s]) {
-      return;
-    }
-    if (store->slot_map[s] == heap_idx + 1) {
-      break;
-    }
-  }
-
-  if (store->slot_map[s] != heap_idx + 1) {
-    return;
-  }
-
-  /* backward shift deletion */
-  size_t j = s;
-  for (size_t i = 1; i < store->slot_map_cap; i++) {
-    size_t k = (s + i) & mask;
-    if (!store->slot_map[k]) {
-      break;
-    }
-    uint32_t index = store->slot_map[k] - 1;
-    uint64_t resident_hash = store->exact
-                                 ? compact_hash(store->counts[index].key)
-                                 : store->heap[index].hash;
-    size_t orig = (size_t)(resident_hash & mask);
-    bool can_move = false;
-    if (j <= k) {
-      can_move = (orig <= j || orig > k);
-    } else {
-      can_move = (orig <= j && orig > k);
-    }
-    if (can_move) {
-      store->slot_map[j] = store->slot_map[k];
-      j = k;
-    }
-  }
-  store->slot_map[j] = 0;
-}
-
 static size_t slot_for_index(const compact_t *store, uint32_t index) {
   uint64_t hash = store->exact ? compact_hash(store->counts[index].key)
                                : store->heap[index].hash;
@@ -106,6 +60,21 @@ static size_t slot_for_index(const compact_t *store, uint32_t index) {
   while (store->slot_map[slot] != index + 1)
     slot = (slot + 1) & (store->slot_map_cap - 1);
   return slot;
+}
+
+static void slot_map_remove(compact_t *store, uint32_t index) {
+  size_t mask = store->slot_map_cap - 1, j = slot_for_index(store, index);
+  for (size_t k = (j + 1) & mask; store->slot_map[k]; k = (k + 1) & mask) {
+    uint32_t moved = store->slot_map[k] - 1;
+    uint64_t hash = store->exact ? compact_hash(store->counts[moved].key)
+                                 : store->heap[moved].hash;
+    size_t orig = (size_t)(hash & mask);
+    if (((k - orig) & mask) >= ((k - j) & mask)) {
+      store->slot_map[j] = store->slot_map[k];
+      j = k;
+    }
+  }
+  store->slot_map[j] = 0;
 }
 
 static void slot_map_rebuild(compact_t *store) {
@@ -123,18 +92,25 @@ static inline double item_rate(const compact_entry_t *item, uint64_t now_ms,
 }
 
 static void heapify_up(compact_t *store, uint32_t idx, uint64_t now_ms) {
+  if (!idx)
+    return;
+  uint32_t parent = (idx - 1) / 2;
+  double rate = item_rate(&store->heap[idx], now_ms, store->half_life_ms);
+  if (!(rate < item_rate(&store->heap[parent], now_ms, store->half_life_ms)))
+    return;
   compact_entry_t held = store->heap[idx];
   size_t held_slot = slot_for_index(store, idx);
-  double rate = item_rate(&held, now_ms, store->half_life_ms);
   uint32_t hole = idx;
-  while (hole > 0) {
-    uint32_t parent = (hole - 1) / 2;
-    if (!(rate < item_rate(&store->heap[parent], now_ms, store->half_life_ms)))
-      break;
+  for (;;) {
     size_t slot = slot_for_index(store, parent);
     store->heap[hole] = store->heap[parent];
     store->slot_map[slot] = hole + 1;
     hole = parent;
+    if (!hole)
+      break;
+    parent = (hole - 1) / 2;
+    if (!(rate < item_rate(&store->heap[parent], now_ms, store->half_life_ms)))
+      break;
   }
   store->heap[hole] = held;
   store->slot_map[held_slot] = hole + 1;
@@ -376,7 +352,7 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
 
   if (full) {
     fss_record(t, t->heap[0].hash, minimum, now);
-    slot_map_remove(t, t->heap[0].hash, 0);
+    slot_map_remove(t, 0);
     idx = 0;
   } else {
     idx = t->heap_size++;
@@ -450,13 +426,19 @@ static size_t exact_prune(compact_t *t, uint64_t now, size_t limit) {
     return 0;
   size_t removed = 0;
   size_t indexed_limit = limit < 1024 ? limit : 1024;
+  double min_rate = 0;
+  uint64_t min_time = 0;
   uint32_t i = 0;
   while (i < t->heap_size && removed < indexed_limit) {
     if (exact_rate(t, i, now) > 0) {
+      if (i == 0 || t->counts[i].rate < min_rate)
+        min_rate = t->counts[i].rate;
+      if (i == 0 || t->counts[i].last_time_ms < min_time)
+        min_time = t->counts[i].last_time_ms;
       i++;
       continue;
     }
-    slot_map_remove(t, compact_hash(t->counts[i].key), i);
+    slot_map_remove(t, i);
     uint32_t last = --t->heap_size;
     if (i != last) {
       size_t slot = slot_for_index(t, last);
@@ -467,6 +449,10 @@ static size_t exact_prune(compact_t *t, uint64_t now, size_t limit) {
   }
   while (i < t->heap_size && removed < limit) {
     if (exact_rate(t, i, now) > 0) {
+      if (i == 0 || t->counts[i].rate < min_rate)
+        min_rate = t->counts[i].rate;
+      if (i == 0 || t->counts[i].last_time_ms < min_time)
+        min_time = t->counts[i].last_time_ms;
       i++;
       continue;
     }
@@ -477,9 +463,11 @@ static size_t exact_prune(compact_t *t, uint64_t now, size_t limit) {
   }
   if (removed > indexed_limit)
     slot_map_rebuild(t);
-  /* refresh the lower envelope even when no zero was found */
-  for (uint32_t j = 0; j < t->heap_size; j++)
-    exact_minimum(t, t->counts[j].rate, t->counts[j].last_time_ms, j == 0);
+  /* refresh the lower envelope only when a full pass inspected all survivors */
+  if (i == t->heap_size) {
+    t->sketch_total = min_rate;
+    t->exact_min_time_ms = min_time;
+  }
   t->forgotten += removed;
   return removed;
 }
@@ -537,7 +525,7 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
 
   if (replacing) {
     idx = 0;
-    slot_map_remove(store, store->heap[idx].hash, idx);
+    slot_map_remove(store, idx);
   } else {
     idx = store->heap_size++;
   }
@@ -605,7 +593,7 @@ static size_t prune_roots(compact_t *store, uint64_t now_ms, double min_rate,
     store->omitted_bound = fmax(store->omitted_bound, rate);
     if (store->kind == BISHFPM_PAIR_FSS)
       fss_record(store, store->heap[0].hash, rate, now_ms);
-    slot_map_remove(store, store->heap[0].hash, 0);
+    slot_map_remove(store, 0);
     uint32_t last = store->heap_size - 1;
     if (last) {
       size_t slot = slot_for_index(store, last);

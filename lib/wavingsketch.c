@@ -107,6 +107,8 @@ static double evidence_at(const wave_store_t *s, const wave_cell_t *cell,
 static bishfpm_store_count_t query_text(const void *raw, const char *key,
                                         size_t length, uint64_t hash,
                                         uint64_t now) {
+  if (!valid_text_key(key, length))
+    return (bishfpm_store_count_t){0, 0, 0, 0, BISHFPM_UPDATE_ZERO, 0};
   const wave_store_t *s = raw;
   now = effective_time(now, s->max_time);
   size_t bucket = bucket_for(s->config, key, length);
@@ -133,6 +135,10 @@ static bishfpm_store_count_t query_text(const void *raw, const char *key,
 static bishfpm_store_count_t update_text(void *raw, const char *key,
                                          size_t length, uint64_t hash,
                                          double weight, uint64_t now) {
+  if (!valid_text_key(key, length))
+    return (bishfpm_store_count_t){
+        0, 0, 0, 0, weight == 0 ? BISHFPM_UPDATE_ZERO : BISHFPM_UPDATE_REJECTED,
+        0};
   wave_store_t *s = raw;
   now = effective_time(now, s->max_time);
   if (!weight)
@@ -164,7 +170,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
       minrate = rate;
     }
   }
-  int sign = sign_for(s->config, key, length);
+  int sign = found < n ? cells[found].sign : sign_for(s->config, key, length);
   double wave = decayed(s, b->wave, dt), rate = weight;
   uint32_t target = found;
   bool replace = false, exact = true;
@@ -208,7 +214,8 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
     if (found == n) {
       if (!cell->occupied)
         s->residents++;
-      memcpy(cell->key, key, length + 1);
+      memcpy(cell->key, key, length);
+      cell->key[length] = '\0';
       cell->length = (uint16_t)length;
       cell->hash = hash;
       cell->sign = sign;
@@ -278,10 +285,10 @@ const bishfpm_store_descriptor_t bishfpm_wavingsketch_store = {
     destroy_config,
     create,
     destroy,
-    prepare,
-    complete,
-    complete,
-    complete,
+    plugin_prepare,
+    plugin_complete,
+    plugin_complete,
+    plugin_complete,
     update_text,
     NULL,
     query_text,

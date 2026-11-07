@@ -201,6 +201,32 @@ check_heuristic_capabilities(const bishfpm_store_descriptor_t *d,
   invalid = *d;
   invalid.capabilities |= BISHFPM_STORE_ABSENT_BOUNDS;
   assert(!bishfpm_create_with_store(&c, NULL, &invalid, s, n));
+  if (d->representation == BISHFPM_STORE_TEXT) {
+    ledger_t l = {0, 0, -1, 0};
+    bishfpm_store_host_t h = {&l, allocate, zeroed, release};
+    void *config = NULL, *state = NULL;
+    assert(d->clone_config(&h, &c, s, n, &config));
+    assert(d->create(&h, config, &state));
+    char *slice = malloc(3);
+    assert(slice);
+    memcpy(slice, "abc", 3);
+    uint64_t hash = bishfpm_murmur3_64(slice, 3, c.hash_seed);
+    assert(d->update_text(state, slice, 3, hash, 2, 0).upper == 2);
+    assert(d->query_text(state, slice, 3, hash, 0).upper == 2);
+    free(slice);
+    assert(d->update_text(state, NULL, 1, 0, 1, 0).outcome ==
+           BISHFPM_UPDATE_REJECTED);
+    assert(d->update_text(state, "a", 0, 0, 1, 0).outcome ==
+           BISHFPM_UPDATE_REJECTED);
+    assert(
+        d->update_text(state, "a", BISHFPM_MAX_PATTERN_LEN, 0, 1, 0).outcome ==
+        BISHFPM_UPDATE_REJECTED);
+    assert(d->query_text(state, NULL, 1, 0, 0).outcome == BISHFPM_UPDATE_ZERO);
+    assert(d->query_text(state, "a", 0, 0, 0).outcome == BISHFPM_UPDATE_ZERO);
+    d->destroy(&h, state);
+    d->destroy_config(&h, config);
+    assert(!l.bytes);
+  }
 }
 #endif
 #endif

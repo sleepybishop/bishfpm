@@ -185,6 +185,8 @@ static bool hk_update(hk_store_t *t, const char *pattern, size_t length,
 static bishfpm_store_count_t query_text(const void *raw, const char *key,
                                         size_t length, uint64_t hash,
                                         uint64_t now) {
+  if (!valid_text_key(key, length))
+    return (bishfpm_store_count_t){0, 0, 0, 0, BISHFPM_UPDATE_ZERO, 0};
   const hk_store_t *s = raw;
   now = effective_time(now, s->max_time_ms);
   uint32_t idx;
@@ -195,6 +197,10 @@ static bishfpm_store_count_t query_text(const void *raw, const char *key,
 static bishfpm_store_count_t update_text(void *raw, const char *pattern,
                                          size_t length, uint64_t hash,
                                          double weight, uint64_t now) {
+  if (!valid_text_key(pattern, length))
+    return (bishfpm_store_count_t){
+        0, 0, 0, 0, weight == 0 ? BISHFPM_UPDATE_ZERO : BISHFPM_UPDATE_REJECTED,
+        0};
   hk_store_t *t = raw;
   /* host already clamps time and discounts late weights */
   now = effective_time(now, t->max_time_ms);
@@ -259,10 +265,10 @@ const bishfpm_store_descriptor_t bishfpm_heavykeeper_store = {
     destroy_config,
     create,
     destroy,
-    prepare,
-    complete,
-    complete,
-    complete,
+    plugin_prepare,
+    plugin_complete,
+    plugin_complete,
+    plugin_complete,
     update_text,
     NULL,
     query_text,
