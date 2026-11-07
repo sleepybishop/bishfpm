@@ -1,5 +1,5 @@
-/* Independent weighted/EWMA adaptation of Li et al., WavingSketch (KDD 2020),
- * Algorithm 1. Only installed public interfaces are used. */
+/* weighted EWMA adaptation of WavingSketch (Li et al., KDD 2020) using only
+ * installed public interfaces */
 #include "bishfpm_hash.h"
 #include "bishfpm_rate.h"
 #include "bishfpm_wavingsketch.h"
@@ -9,11 +9,13 @@
 #include <string.h>
 
 typedef struct {
-  char key[BISHFPM_MAX_PATTERN_LEN];
   uint64_t hash;
+  uint64_t evidence_time;
   double rate, evidence;
   int sign;
+  uint16_t length;
   bool occupied, exact;
+  char key[BISHFPM_MAX_PATTERN_LEN];
 } wave_cell_t;
 typedef struct {
   double wave;
@@ -66,8 +68,7 @@ static bool configure(const bishfpm_config_t *m, const void *raw, size_t n,
   size_t total;
   return checked_mul(o->buckets, o->cells_per_bucket, &c->capacity) &&
          c->capacity <= 1000000 &&
-         checked_mul(c->capacity, sizeof(wave_cell_t) + sizeof(uint64_t),
-                     &c->cell_bytes) &&
+         checked_mul(c->capacity, sizeof(wave_cell_t), &c->cell_bytes) &&
          checked_mul(o->buckets, sizeof(wave_bucket_t), &c->bucket_bytes) &&
          checked_add(sizeof(wave_store_t), c->cell_bytes, &total) &&
          checked_add(total, c->bucket_bytes, &c->group_bytes);
@@ -129,9 +130,8 @@ static void complete(void *raw, void *token) {
   (void)raw;
   (void)token;
 }
-/* Independent seeded hash domains for bucket placement and wave sign. The
- * caller's index hash is only an identity prefilter; full keys resolve aliases.
- */
+/* independent seeded hash domains for bucket placement and wave sign; caller
+ * hash is an identity prefilter and full keys resolve aliases */
 static size_t bucket_for(const wave_config_t *c, const char *key,
                          size_t length) {
   return bishfpm_murmur3_64(key, length,
@@ -146,22 +146,17 @@ static int sign_for(const wave_config_t *c, const char *key, size_t length) {
              : -1;
 }
 static double decayed(const wave_store_t *s, double value, uint64_t dt) {
-  /* Preserve the sign and avoid premature multiplier underflow for large
-   * counts: the public decay routine accepts only nonnegative rates. */
+  /* preserve sign and avoid premature multiplier underflow for large counts */
   return dt ? copysign(
                   bishfpm_rate_decay(fabs(value), dt, s->config->half_life),
                   value)
             : value;
 }
-/* Keep timestamps after the heavy-cell array so independent evidence does
- * not enlarge the hot heavy-cell stride. Both arrays share one allocation. */
-static uint64_t *evidence_times(const wave_store_t *s) {
-  return (uint64_t *)(s->cells + s->config->capacity);
-}
-static double evidence_at(const wave_store_t *s, size_t index, uint64_t now) {
-  uint64_t then = evidence_times(s)[index];
-  return now <= then ? s->cells[index].evidence
-                     : bishfpm_rate_decay(s->cells[index].evidence, now - then,
+static double evidence_at(const wave_store_t *s, const wave_cell_t *cell,
+                          uint64_t now) {
+  uint64_t then = cell->evidence_time;
+  return now <= then ? cell->evidence
+                     : bishfpm_rate_decay(cell->evidence, now - then,
                                           s->config->half_life);
 }
 static bishfpm_store_count_t query_text(const void *raw, const char *key,
@@ -175,14 +170,13 @@ static bishfpm_store_count_t query_text(const void *raw, const char *key,
       &s->cells[bucket * s->config->options.cells_per_bucket];
   for (uint32_t i = 0; i < s->config->options.cells_per_bucket; i++)
     if (cells[i].occupied && cells[i].hash == hash &&
-        !strcmp(cells[i].key, key))
-      return (bishfpm_store_count_t){
-          evidence_at(s, bucket * s->config->options.cells_per_bucket + i, now),
-          decayed(s, cells[i].rate, now - b->time),
-          1,
-          0,
-          BISHFPM_UPDATE_ZERO,
-          0};
+        cells[i].length == length && !memcmp(cells[i].key, key, length))
+      return (bishfpm_store_count_t){evidence_at(s, &cells[i], now),
+                                     decayed(s, cells[i].rate, now - b->time),
+                                     1,
+                                     0,
+                                     BISHFPM_UPDATE_ZERO,
+                                     0};
   return (bishfpm_store_count_t){0,
                                  fmax(0, decayed(s, b->wave, now - b->time) *
                                              sign_for(s->config, key, length)),
@@ -207,7 +201,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
   wave_cell_t *cells = &s->cells[bucket * n];
   uint32_t found = n, empty = n, minimum = n;
   double minrate = DBL_MAX;
-  double rates[64]; /* Config bounds the bucket width; no update allocation. */
+  double rates[64]; /* config bounds bucket width; no update allocation */
   uint64_t dt = now - b->time;
   for (uint32_t i = 0; i < n; i++) {
     if (!cells[i].occupied) {
@@ -215,7 +209,8 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
         empty = i;
       continue;
     }
-    if (cells[i].hash == hash && !strcmp(cells[i].key, key))
+    if (cells[i].hash == hash && cells[i].length == length &&
+        !memcmp(cells[i].key, key, length))
       found = i;
     double rate = rates[i] = decayed(s, cells[i].rate, dt);
     if (minimum == n || rate < minrate) {
@@ -235,7 +230,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
   } else if (empty < n)
     target = empty;
   else {
-    /* Algorithm 1 compares the PRE-update projection with the minimum. */
+    /* compare pre-update projection with minimum */
     double projection = wave * sign;
     wave += sign * weight;
     if (projection >= minrate) {
@@ -248,10 +243,9 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
     }
   }
   double evidence =
-      found < n ? evidence_at(s, bucket * n + found, now) + weight : weight;
+      found < n ? evidence_at(s, &cells[found], now) + weight : weight;
   double total = decayed(s, s->total, now - s->max_time);
-  /* Preflight every potentially overflowing result before changing clocks,
-   * bucket decay, heavy identities or the signed wave counter. */
+  /* preflight potentially overflowing results before mutating state */
   if (weight > DBL_MAX - total || !isfinite(total + weight) ||
       !isfinite(rate) || !isfinite(wave) || !isfinite(evidence))
     return r;
@@ -269,6 +263,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
       if (!cell->occupied)
         s->residents++;
       memcpy(cell->key, key, length + 1);
+      cell->length = (uint16_t)length;
       cell->hash = hash;
       cell->sign = sign;
       cell->occupied = true;
@@ -276,7 +271,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
     }
     cell->rate = rate;
     cell->evidence = evidence;
-    evidence_times(s)[bucket * n + target] = now;
+    cell->evidence_time = now;
     r.resident = 1;
     r.upper = rate;
     r.lower = evidence;
@@ -291,7 +286,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *key,
 }
 static size_t prune(void *raw, uint64_t now, double cutoff) {
   wave_store_t *s = raw;
-  (void)cutoff; /* Keep positive heavy counts and signed history together. */
+  (void)cutoff; /* keep positive heavy counts and signed history together */
   now = effective_time(now, s->max_time);
   size_t removed = 0;
   uint32_t n = s->config->options.cells_per_bucket;
@@ -302,7 +297,7 @@ static size_t prune(void *raw, uint64_t now, double cutoff) {
     bool zero = decayed(s, b->wave, dt) == 0;
     for (uint32_t i = 0; i < n && zero; i++)
       if (cells[i].occupied && (decayed(s, cells[i].rate, dt) != 0 ||
-                                evidence_at(s, (size_t)j * n + i, now) != 0))
+                                evidence_at(s, &cells[i], now) != 0))
         zero = false;
     if (zero) {
       for (uint32_t i = 0; i < n; i++) {

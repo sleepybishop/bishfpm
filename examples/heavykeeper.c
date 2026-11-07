@@ -24,7 +24,7 @@ int main(void) {
     return 1;
   const char *items[] = {"a", "b", "c"};
   int alerts = bishfpm_add_event(engine, "g", 0, items, 3, alert, NULL);
-  double estimate = bishfpm_pattern_estimate(engine, "g", "a\037b", 0);
+  double estimate = bishfpm_pattern_rate(engine, "g", "a\037b", 0);
   bishfpm_count_bounds_t bounds;
   int valid = bishfpm_pattern_bounds(engine, "g", "a\037b", 0, &bounds);
   bishfpm_free(engine);

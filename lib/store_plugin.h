@@ -22,6 +22,4 @@ BISHFPM_PRIVATE bool store_extension_init(store_extension_t *,
                                           const void *, size_t);
 BISHFPM_PRIVATE topk_result_t store_extension_update_count(
     const store_extension_t *, bishfpm_store_count_t, uint64_t);
-BISHFPM_PRIVATE topk_result_t store_extension_count(bishfpm_store_count_t,
-                                                    uint64_t);
 #endif

@@ -62,8 +62,13 @@ bool store_extension_validate(const bishfpm_store_descriptor_t *d,
 }
 static void *host_allocate(void *ctx, size_t bytes) {
   store_extension_t *x = ctx;
-  if (!bytes || bytes > x->limit - x->bytes)
+  if (!bytes)
     return NULL;
+  if (bytes > x->limit - x->bytes) {
+    if (x->budget)
+      x->budget->denials++;
+    return NULL;
+  }
   void *p = memory_malloc(x->budget, bytes);
   if (p)
     x->bytes += bytes;
@@ -72,13 +77,12 @@ static void *host_allocate(void *ctx, size_t bytes) {
 static void *host_zeroed(void *ctx, size_t n, size_t size) {
   store_extension_t *x = ctx;
   size_t bytes;
-  if (!n || !size || !size_mul(n, size, &bytes)) {
+  if (!n || !size || !size_mul(n, size, &bytes) ||
+      bytes > x->limit - x->bytes) {
     if (n && size && x->budget)
       x->budget->denials++;
     return NULL;
   }
-  if (bytes > x->limit - x->bytes)
-    return NULL;
   void *p = memory_calloc(x->budget, n, size);
   if (p)
     x->bytes += bytes;
@@ -128,12 +132,15 @@ static void extension_destroy(store_t *s) {
   if (s->state.extension)
     x->descriptor.destroy(&x->host, s->state.extension);
 }
-topk_result_t store_extension_count(bishfpm_store_count_t r, uint64_t hash) {
+static bool certified_valid(bishfpm_store_count_t r) {
+  return r.known == 1 && isfinite(r.lower) && isfinite(r.upper) &&
+         r.lower >= 0 && r.upper >= r.lower && !r.reserved && r.resident <= 1;
+}
+static topk_result_t store_extension_count(bishfpm_store_count_t r,
+                                           uint64_t hash) {
   /* extensions are trusted, but a malformed/uncertified interval cannot alert
    */
-  bool valid = r.known && isfinite(r.lower) && isfinite(r.upper) &&
-               r.lower >= 0 && r.upper >= r.lower && !r.reserved &&
-               r.resident <= 1 && r.known == 1;
+  bool valid = certified_valid(r);
   topk_result_t result = {0};
   result.present = valid && r.resident;
   result.was_present = r.outcome == BISHFPM_UPDATE_RESIDENT;
@@ -168,7 +175,7 @@ topk_result_t store_extension_update_count(const store_extension_t *x,
   count.replaced = r.outcome == BISHFPM_UPDATE_REPLACED;
   count.accepted = r.outcome >= BISHFPM_UPDATE_RESIDENT &&
                    r.outcome <= BISHFPM_UPDATE_FILTERED;
-  /* Explicit alert policy; neither value is exposed as a certified bound. */
+  /* explicit alert policy; neither value is exposed as a certified bound */
   count.lower = x->descriptor.capabilities & BISHFPM_STORE_ALERT_EVIDENCE
                     ? r.lower
                     : r.upper;
@@ -182,19 +189,14 @@ static store_result_t extension_result(const store_extension_t *x,
     topk_result_t count = {0};
     if (heuristic_valid(x, r)) {
       count.present = r.resident;
-      count.upper = r.upper; /* Raw query estimate, with known=false. */
+      count.upper = r.upper; /* raw query estimate with known=false */
       if (x->descriptor.capabilities & BISHFPM_STORE_ALERT_EVIDENCE)
-        count.lower =
-            r.lower; /* Internal subset evidence, not public bounds. */
+        count.lower = r.lower; /* internal subset evidence, not public bounds */
     }
     count.error = INFINITY;
     return (store_result_t){count, false};
   }
-  topk_result_t count = store_extension_count(r, 0);
-  bool known = r.known == 1 && isfinite(r.lower) && isfinite(r.upper) &&
-               r.lower >= 0 && r.upper >= r.lower && !r.reserved &&
-               r.resident <= 1;
-  return (store_result_t){count, known};
+  return (store_result_t){store_extension_count(r, 0), certified_valid(r)};
 }
 static store_result_t extension_query_text(const store_t *s, const char *key,
                                            uint64_t now) {

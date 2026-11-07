@@ -495,7 +495,7 @@ static void evidence_policy(void) {
     assert(bishfpm_add_event(e, "g", 0, ab, 2, evidence_alert, &alerts) ==
            (legacy ? 1 : 0));
     assert(alerts == legacy);
-    assert(bishfpm_pattern_estimate(e, "g", "a\037b", 0) == 99);
+    assert(bishfpm_pattern_rate(e, "g", "a\037b", 0) == 99);
     bishfpm_count_bounds_t b;
     assert(bishfpm_pattern_bounds(e, "g", "a\037b", 0, &b));
     assert(!b.known && b.resident && b.lower == 0 && isinf(b.upper));

@@ -232,11 +232,6 @@ double bishfpm_item_rate(bishfpm_t *engine, const char *group_key,
 double bishfpm_pattern_rate(bishfpm_t *engine, const char *group_key,
                             const char *pattern, uint64_t now_ms);
 
-/* Explicit estimate spelling: certified stores return their upper estimate;
- * heuristic plugins return their uncertified estimate. */
-double bishfpm_pattern_estimate(bishfpm_t *, const char *group,
-                                const char *pattern, uint64_t now_ms);
-
 /* Numeric pair engines: forget at most max_pairs weak candidates in the named
  * group, using options.forget_below. SS/FSS remove upper counts strictly below
  * the cutoff; threshold also removes equal counts. Leaves groups and marginal

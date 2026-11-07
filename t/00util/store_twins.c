@@ -28,15 +28,21 @@ static size_t layout(const config_t *c) {
 }
 static int plan(const bishfpm_config_t *m, const void *raw, size_t n,
                 bishfpm_store_plan_t *out) {
-  if (!raw || n != sizeof(twin_options_t))
+  if (!m || !raw || !out || n != sizeof(twin_options_t))
     return 0;
   const twin_options_t *o = raw;
+  bool pair = o->kind >= 2;
+  if (pair && (m->min_itemset_order != 2 || m->max_itemset_order != 2))
+    return 0;
   config_t c = {*o, *m};
   size_t bytes = layout(&c);
   if (o->kind > 4 || !bytes)
     return 0;
-  *out = (bishfpm_store_plan_t){
-      sizeof(config_t), sizeof(state_t) + bytes, 1, 32, {0, 0}};
+  *out = (bishfpm_store_plan_t){sizeof(config_t),
+                                sizeof(state_t) + bytes,
+                                pair ? 2 : 1,
+                                pair ? 2 : BISHFPM_MAX_ITEMSET_ORDER,
+                                {0, 0}};
   return 1;
 }
 static int clone(const bishfpm_store_host_t *h, const bishfpm_config_t *m,

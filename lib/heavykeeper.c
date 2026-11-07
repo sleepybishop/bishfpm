@@ -1,18 +1,20 @@
-/* Extracted from perf (028ae33):lib/topk.c. Keep this backend independent
- * of private engine/store layouts; it uses only installed public interfaces. */
+/* EWMA-decayed HeavyKeeper store plugin using only installed public interfaces
+ */
 #include "bishfpm_hash.h"
 #include "bishfpm_heavykeeper.h"
 #include "bishfpm_rate.h"
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 
 typedef struct {
-  char pattern[BISHFPM_MAX_PATTERN_LEN];
   uint64_t hash;
   double rate;
   uint64_t last_time_ms;
+  uint16_t length;
+  char pattern[BISHFPM_MAX_PATTERN_LEN];
 } hk_entry_t;
 typedef struct {
   uint64_t hash;
@@ -149,9 +151,13 @@ static void complete(void *state, void *token) {
   (void)state;
   (void)token;
 }
+static inline void copy_entry(hk_entry_t *dst, const hk_entry_t *src) {
+  memcpy(dst, src, offsetof(hk_entry_t, pattern) + src->length + 1);
+}
+
 /* find slot in hash map */
 static int slot_map_find(const hk_store_t *topk, const char *pattern,
-                         uint64_t hash, uint32_t *out_idx) {
+                         size_t length, uint64_t hash, uint32_t *out_idx) {
   size_t cap = topk->config->slots, mask = cap - 1;
   size_t idx = (size_t)(hash & mask);
 
@@ -162,7 +168,8 @@ static int slot_map_find(const hk_store_t *topk, const char *pattern,
     }
     if (topk->slot_map[s].hash == hash) {
       uint32_t h_idx = topk->slot_map[s].heap_idx;
-      if (strcmp(topk->heap[h_idx].pattern, pattern) == 0) {
+      if (topk->heap[h_idx].length == length &&
+          memcmp(topk->heap[h_idx].pattern, pattern, length) == 0) {
         if (out_idx) {
           *out_idx = h_idx;
         }
@@ -189,7 +196,7 @@ static void slot_map_set(hk_store_t *topk, uint64_t hash, uint32_t heap_idx) {
   }
 }
 
-/* Locate by old heap position as well as hash, before either item moves. */
+/* locate by old heap position and hash before moving */
 static size_t slot_for_index(const hk_store_t *topk, uint32_t index) {
   size_t mask = topk->config->slots - 1;
   size_t slot = topk->heap[index].hash & mask;
@@ -235,12 +242,13 @@ static void heapify_up(hk_store_t *topk, uint32_t idx, uint64_t now_ms) {
   double rate = item_rate(&topk->heap[idx], now_ms, half);
   if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
     return;
-  hk_entry_t held = topk->heap[idx];
+  hk_entry_t held;
+  copy_entry(&held, &topk->heap[idx]);
   size_t held_slot = slot_for_index(topk, idx);
   uint32_t hole = idx;
   for (;;) {
     size_t slot = slot_for_index(topk, parent);
-    topk->heap[hole] = topk->heap[parent];
+    copy_entry(&topk->heap[hole], &topk->heap[parent]);
     topk->slot_map[slot].heap_idx = hole;
     hole = parent;
     if (!hole)
@@ -249,7 +257,7 @@ static void heapify_up(hk_store_t *topk, uint32_t idx, uint64_t now_ms) {
     if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
       break;
   }
-  topk->heap[hole] = held;
+  copy_entry(&topk->heap[hole], &held);
   topk->slot_map[held_slot].heap_idx = hole;
 }
 
@@ -270,15 +278,14 @@ static void heapify_down(hk_store_t *topk, uint32_t idx, uint64_t now_ms) {
   }
   if (!(child_rate < held_rate))
     return;
-  /* Carry the updated entry through a hole instead of swapping two complete
-   * pattern buffers at every level. Probe chains do not change, only indices.
-   * Strict comparisons retain the existing tie and enumeration behavior. */
-  hk_entry_t held = topk->heap[idx];
+  /* carry updated entry through a hole and copy only active pattern bytes */
+  hk_entry_t held;
+  copy_entry(&held, &topk->heap[idx]);
   size_t held_slot = slot_for_index(topk, idx);
   uint32_t hole = idx;
   for (;;) {
     size_t child_slot = slot_for_index(topk, child);
-    topk->heap[hole] = topk->heap[child];
+    copy_entry(&topk->heap[hole], &topk->heap[child]);
     topk->slot_map[child_slot].heap_idx = hole;
     hole = child;
     child = 2 * hole + 1;
@@ -295,15 +302,12 @@ static void heapify_down(hk_store_t *topk, uint32_t idx, uint64_t now_ms) {
     if (!(child_rate < held_rate))
       break;
   }
-  topk->heap[hole] = held;
+  copy_entry(&topk->heap[hole], &held);
   topk->slot_map[held_slot].heap_idx = hole;
 }
 
-/* HeavyKeeper collision decay adapted from oldhk:lib/topk.c. Integer weights
- * use geometric skips of Bernoulli trials; a discounted fractional remainder
- * gets one proportional decrement trial. Unlike oldhk, no artificial floor of
- * one is applied to decayed/late updates. Fingerprints remain approximate;
- * resident identity checks use the full string in the current index. */
+/* integer weights use geometric skips of Bernoulli trials; fractional
+ * remainders use one proportional decrement trial */
 static double hk_uniform(hk_store_t *t) {
   return ((double)(bishfpm_splitmix64(&t->rng_state) >> 11) + 1) /
          9007199254740994.0;
@@ -397,7 +401,7 @@ static bishfpm_store_count_t query_text(const void *raw, const char *key,
   const hk_store_t *s = raw;
   now = effective_time(now, s->max_time_ms);
   uint32_t idx;
-  bool resident = slot_map_find(s, key, hash, &idx);
+  bool resident = slot_map_find(s, key, length, hash, &idx);
   return (bishfpm_store_count_t){
       0, hk_estimate(s, key, length, now), resident, 0, BISHFPM_UPDATE_ZERO, 0};
 }
@@ -405,7 +409,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *pattern,
                                          size_t length, uint64_t hash,
                                          double weight, uint64_t now) {
   hk_store_t *t = raw;
-  /* Host already clamps time and discounts late weights. */
+  /* host already clamps time and discounts late weights */
   now = effective_time(now, t->max_time_ms);
   if (!weight)
     return query_text(t, pattern, length, hash, now);
@@ -419,7 +423,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *pattern,
   t->hk_total = total + weight;
   t->max_time_ms = now;
   uint32_t idx, k = t->config->options.capacity;
-  bool present = slot_map_find(t, pattern, hash, &idx);
+  bool present = slot_map_find(t, pattern, length, hash, &idx);
   bool full = t->heap_size == k;
   r.upper = estimate;
   r.outcome = BISHFPM_UPDATE_FILTERED;
@@ -431,6 +435,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *pattern,
     if (full)
       slot_map_remove(t, 0);
     memcpy(t->heap[idx].pattern, pattern, length + 1);
+    t->heap[idx].length = (uint16_t)length;
     t->heap[idx].hash = hash;
   }
   t->heap[idx].rate = estimate;
@@ -457,7 +462,9 @@ static size_t prune(void *raw, uint64_t now, double cutoff) {
   size_t removed = 0;
   while (i < s->heap_size) {
     if (item_rate(&s->heap[i], now, half) < cutoff) {
-      s->heap[i] = s->heap[--s->heap_size];
+      --s->heap_size;
+      if (i < s->heap_size)
+        copy_entry(&s->heap[i], &s->heap[s->heap_size]);
       removed++;
     } else
       i++;

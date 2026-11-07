@@ -205,8 +205,12 @@ static void engines(void) {
     bishfpm_count_bounds_t b;
     assert(bishfpm_pattern_bounds(e, "g", "a\037b", 0, &b));
     assert(!b.known && b.resident && b.lower == 0 && isinf(b.upper));
-    assert(bishfpm_pattern_estimate(e, "g", "a\037b", 0) == 1);
-    assert(bishfpm_pattern_estimate(e, "g", "missing\037x", 0) == 0);
+    assert(bishfpm_pattern_rate(e, "g", "a\037b", 0) == 1);
+    assert(bishfpm_pattern_rate(e, "g", "missing\037x", 0) == 0);
+    bishfpm_pair_stats_t ps = {9, 9, 9, 9};
+    bishfpm_get_pair_stats(e, &ps);
+    assert(!ps.capacity_rejections && !ps.patterns_forgotten &&
+           !ps.resident_pairs && !ps.store_bytes);
     bishfpm_store_snapshot_t stats;
     assert(bishfpm_get_store_snapshot(e, "g", sizeof(stats), &stats));
     assert(stats.resident_patterns == 3);

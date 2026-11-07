@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <float.h>
 #include <math.h>
+#include <stdbool.h>
 #include <string.h>
 
 typedef struct {
@@ -24,15 +25,14 @@ typedef struct {
 } state_t;
 static int plan(const bishfpm_config_t *c, const void *raw, size_t bytes,
                 bishfpm_store_plan_t *out) {
-  if (!raw || bytes != sizeof(exact_store_options_t))
+  if (!c || !raw || !out || bytes != sizeof(exact_store_options_t))
     return 0;
   const exact_store_options_t *o = raw;
+  bool pair = o->representation == BISHFPM_STORE_PAIR64;
   if (!o->capacity || o->capacity > 1000000 || !o->name ||
       strlen(o->name) > 255 ||
-      (o->representation != BISHFPM_STORE_TEXT &&
-       o->representation != BISHFPM_STORE_PAIR64) ||
-      (o->representation == BISHFPM_STORE_PAIR64 &&
-       (c->min_itemset_order != 2 || c->max_itemset_order != 2)))
+      (o->representation != BISHFPM_STORE_TEXT && !pair) ||
+      (pair && (c->min_itemset_order != 2 || c->max_itemset_order != 2)))
     return 0;
   size_t entries = (size_t)o->capacity * sizeof(entry_t);
   if (entries / sizeof(entry_t) != o->capacity ||
@@ -42,8 +42,8 @@ static int plan(const bishfpm_config_t *c, const void *raw, size_t bytes,
                                 sizeof(state_t) +
                                     (size_t)o->capacity * sizeof(entry_t) +
                                     sizeof(uint64_t),
-                                1,
-                                BISHFPM_MAX_ITEMSET_ORDER,
+                                pair ? 2 : 1,
+                                pair ? 2 : BISHFPM_MAX_ITEMSET_ORDER,
                                 {0, 0}};
   return 1;
 }

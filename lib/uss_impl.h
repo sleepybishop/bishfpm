@@ -1,12 +1,12 @@
-/* Weighted Unbiased Space Saving, following Ting (SIGMOD 2018), with
- * pairwise unbiased reduction and lazy exponential time decay. Only installed
- * public interfaces are used. */
+/* weighted Unbiased Space Saving (Ting, SIGMOD 2018) with pairwise unbiased
+ * reduction and lazy exponential time decay using public interfaces */
 #include "bishfpm_hash.h"
 #include "bishfpm_rate.h"
 #include "bishfpm_uss.h"
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 
 #ifdef BISHFPM_USS_PAIR64
@@ -19,11 +19,14 @@ typedef struct {
 #ifdef BISHFPM_USS_PAIR64
   uint64_t key;
 #else
-  char pattern[BISHFPM_MAX_PATTERN_LEN];
   uint64_t hash;
 #endif
   double rate, evidence;
   uint64_t last_time_ms;
+#ifndef BISHFPM_USS_PAIR64
+  uint16_t length;
+  char pattern[BISHFPM_MAX_PATTERN_LEN];
+#endif
 } uss_entry_t;
 #ifndef BISHFPM_USS_PAIR64
 typedef struct {
@@ -155,6 +158,13 @@ static void complete(void *state, void *token) {
   (void)state;
   (void)token;
 }
+static inline void copy_entry(uss_entry_t *dst, const uss_entry_t *src) {
+#ifdef BISHFPM_USS_PAIR64
+  *dst = *src;
+#else
+  memcpy(dst, src, offsetof(uss_entry_t, pattern) + src->length + 1);
+#endif
+}
 static uint64_t entry_hash(const uss_entry_t *e) {
 #ifdef BISHFPM_USS_PAIR64
   uint64_t key = e->key;
@@ -163,11 +173,12 @@ static uint64_t entry_hash(const uss_entry_t *e) {
   return e->hash;
 #endif
 }
-static bool entry_matches(const uss_entry_t *e, uss_key_t key) {
+static bool entry_matches(const uss_entry_t *e, uss_key_t key, size_t length) {
 #ifdef BISHFPM_USS_PAIR64
+  (void)length;
   return e->key == key;
 #else
-  return strcmp(e->pattern, key) == 0;
+  return e->length == length && memcmp(e->pattern, key, length) == 0;
 #endif
 }
 static void entry_identity(uss_entry_t *e, uss_key_t key, size_t length,
@@ -178,6 +189,7 @@ static void entry_identity(uss_entry_t *e, uss_key_t key, size_t length,
   e->key = key;
 #else
   memcpy(e->pattern, key, length + 1);
+  e->length = (uint16_t)length;
   e->hash = hash;
 #endif
 }
@@ -209,8 +221,8 @@ static uint64_t slot_hash(const uss_store_t *s, size_t slot) {
   return s->slot_map[slot].hash;
 #endif
 }
-static int slot_map_find(const uss_store_t *s, uss_key_t key, uint64_t hash,
-                         uint32_t *out_idx) {
+static int slot_map_find(const uss_store_t *s, uss_key_t key, size_t length,
+                         uint64_t hash, uint32_t *out_idx) {
   size_t mask = s->config->slots - 1;
   for (size_t i = 0; i < s->config->slots; i++) {
     size_t slot = (hash + i) & mask;
@@ -221,7 +233,7 @@ static int slot_map_find(const uss_store_t *s, uss_key_t key, uint64_t hash,
     if (s->slot_map[slot].hash != hash)
       continue;
 #endif
-    if (entry_matches(&s->heap[index], key)) {
+    if (entry_matches(&s->heap[index], key, length)) {
       if (out_idx)
         *out_idx = index;
       return 1;
@@ -243,8 +255,7 @@ static void slot_map_set(uss_store_t *s, uint64_t hash, uint32_t index) {
     }
   }
 }
-/* During hole moves, locate by original index before moving the row. Hash
- * derivation from numeric rows is used only while the index is consistent. */
+/* locate by original heap index before moving the row */
 static size_t slot_for_index(const uss_store_t *s, uint32_t index) {
   size_t mask = s->config->slots - 1;
   size_t slot = entry_hash(&s->heap[index]) & mask;
@@ -286,12 +297,13 @@ static void heapify_up(uss_store_t *topk, uint32_t idx, uint64_t now_ms) {
   double rate = item_rate(&topk->heap[idx], now_ms, half);
   if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
     return;
-  uss_entry_t held = topk->heap[idx];
+  uss_entry_t held;
+  copy_entry(&held, &topk->heap[idx]);
   size_t held_slot = slot_for_index(topk, idx);
   uint32_t hole = idx;
   for (;;) {
     size_t slot = slot_for_index(topk, parent);
-    topk->heap[hole] = topk->heap[parent];
+    copy_entry(&topk->heap[hole], &topk->heap[parent]);
     slot_index_set(&topk->slot_map[slot], hole);
     hole = parent;
     if (!hole)
@@ -300,7 +312,7 @@ static void heapify_up(uss_store_t *topk, uint32_t idx, uint64_t now_ms) {
     if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
       break;
   }
-  topk->heap[hole] = held;
+  copy_entry(&topk->heap[hole], &held);
   slot_index_set(&topk->slot_map[held_slot], hole);
 }
 
@@ -321,15 +333,14 @@ static void heapify_down(uss_store_t *topk, uint32_t idx, uint64_t now_ms) {
   }
   if (!(child_rate < held_rate))
     return;
-  /* Carry the updated entry through a hole instead of swapping two complete
-   * pattern buffers at every level. Probe chains do not change, only indices.
-   * Strict comparisons retain the existing tie and enumeration behavior. */
-  uss_entry_t held = topk->heap[idx];
+  /* carry updated entry through a hole and copy only active pattern bytes */
+  uss_entry_t held;
+  copy_entry(&held, &topk->heap[idx]);
   size_t held_slot = slot_for_index(topk, idx);
   uint32_t hole = idx;
   for (;;) {
     size_t child_slot = slot_for_index(topk, child);
-    topk->heap[hole] = topk->heap[child];
+    copy_entry(&topk->heap[hole], &topk->heap[child]);
     slot_index_set(&topk->slot_map[child_slot], hole);
     hole = child;
     child = 2 * hole + 1;
@@ -346,18 +357,17 @@ static void heapify_down(uss_store_t *topk, uint32_t idx, uint64_t now_ms) {
     if (!(child_rate < held_rate))
       break;
   }
-  topk->heap[hole] = held;
+  copy_entry(&topk->heap[hole], &held);
   slot_index_set(&topk->slot_map[held_slot], hole);
 }
 
 static bishfpm_store_count_t query_key(const void *raw, uss_key_t key,
                                        size_t length, uint64_t hash,
                                        uint64_t now) {
-  (void)length;
   const uss_store_t *s = raw;
   now = effective_time(now, s->max_time_ms);
   uint32_t idx;
-  bool resident = slot_map_find(s, key, hash, &idx);
+  bool resident = slot_map_find(s, key, length, hash, &idx);
   return (bishfpm_store_count_t){
       resident ? decay_since(s->heap[idx].evidence, s->heap[idx].last_time_ms,
                              now, s->config->half_life_ms)
@@ -379,13 +389,12 @@ static bishfpm_store_count_t update_key(void *raw, uss_key_t pattern,
   double half = s->config->half_life_ms;
   double total = decay_since(s->total, s->max_time_ms, now, half);
   uint32_t idx, k = s->config->options.capacity;
-  bool present = slot_map_find(s, pattern, hash, &idx);
+  bool present = slot_map_find(s, pattern, length, hash, &idx);
   bool full = s->heap_size == k;
   if (!present)
     idx = full ? 0 : s->heap_size;
   double old = (present || full) ? item_rate(&s->heap[idx], now, half) : 0;
-  /* Reject before clocks, counters, identities, or RNG change. The local
-   * check also protects against rounding differences in lazy total decay. */
+  /* reject before clocks, counters, identities, or RNG change */
   if (!(weight > 0) || weight > DBL_MAX - total || weight > DBL_MAX - old)
     return r;
   double evidence = (present || full)
@@ -403,8 +412,7 @@ static bishfpm_store_count_t update_key(void *raw, uss_key_t pattern,
                (1.0 / 9007199254740992.0);
     retain = u < weight / combined;
   }
-  /* Even when the incoming identity loses, its weight increases the old
-   * minimum. E[new estimate]=w; E[old estimate]=old in exact arithmetic. */
+  /* losing incoming identity still increases old minimum for unbiasedness */
   if (!present && retain) {
     if (full)
       slot_map_remove(s, idx);
@@ -413,8 +421,7 @@ static bishfpm_store_count_t update_key(void *raw, uss_key_t pattern,
     entry_identity(&s->heap[idx], pattern, length, hash);
     slot_map_set(s, hash, idx);
   }
-  /* A losing incoming identity contributes sampled mass, not evidence for
-   * the retained identity. Admission starts fresh, never with victim mass. */
+  /* losing incoming identity adds sampled mass, not resident evidence */
   evidence = present ? evidence + weight : retain ? weight : evidence;
   s->heap[idx].evidence = evidence;
   s->heap[idx].rate = combined;
@@ -435,7 +442,7 @@ static bishfpm_store_count_t update_key(void *raw, uss_key_t pattern,
 static size_t prune(void *raw, uint64_t now, double cutoff) {
   uss_store_t *s = raw;
   double half = s->config->half_life_ms;
-  (void)cutoff; /* Discarding positive sampled mass would bias estimates. */
+  (void)cutoff; /* discarding positive sampled mass would bias estimates */
   now = effective_time(now, s->max_time_ms);
   s->total = decay_since(s->total, s->max_time_ms, now, half);
   s->max_time_ms = now;
@@ -443,7 +450,9 @@ static size_t prune(void *raw, uint64_t now, double cutoff) {
   size_t removed = 0;
   while (i < s->heap_size) {
     if (item_rate(&s->heap[i], now, half) == 0) {
-      s->heap[i] = s->heap[--s->heap_size];
+      --s->heap_size;
+      if (i < s->heap_size)
+        copy_entry(&s->heap[i], &s->heap[s->heap_size]);
       removed++;
     } else
       i++;

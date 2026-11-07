@@ -4,10 +4,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Experimental EWMA-decayed HeavyKeeper variant from perf:lib/topk.c.
- * This is not the original integer-count algorithm.
- * Selecting this descriptor explicitly opts into estimate-based alerts.
- * Estimates are not certified lower or upper bounds. */
+/* experimental EWMA-decayed HeavyKeeper store plugin; selecting this
+ * descriptor explicitly opts into estimate-based alerts without certified
+ * lower or upper bounds */
 typedef struct {
   uint32_t capacity; /* 1..1000000 resident candidates; independent of
                         notifications */

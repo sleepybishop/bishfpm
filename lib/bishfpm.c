@@ -1067,6 +1067,8 @@ static int prepare_event(bishfpm_t *engine, const char *const *items,
     length = max_k - 1;
     for (size_t i = 0; i < max_k; i++)
       length += event->lengths[i];
+    for (size_t i = 0; i < event->count; i++)
+      event->lengths[i] = event->items[i].length;
   }
   if (length >= BISHFPM_MAX_PATTERN_LEN) {
     *reason = REJECT_PATTERN_LENGTH;
@@ -1157,8 +1159,6 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     effective_weight = decay_since((double)weight, timestamp_ms, now,
                                    engine->cfg.ewma_half_life_ms);
     store_extension_t *x = engine->store_config.extension;
-    for (size_t i = 0; i < event->count; i++)
-      event->lengths[i] = event->items[i].length;
     bishfpm_store_event_t view = {event->keys,
                                   event->lengths,
                                   engine->numeric_pairs ? event->ids : NULL,
@@ -1409,10 +1409,12 @@ void bishfpm_get_pair_stats(const bishfpm_t *engine,
                             bishfpm_pair_stats_t *out) {
   if (!engine || !out)
     return;
+  if (!engine->numeric_pairs || engine->store_config.extension) {
+    *out = (bishfpm_pair_stats_t){0};
+    return;
+  }
   *out = (bishfpm_pair_stats_t){engine->pair_capacity_rejections,
                                 engine->pairs_forgotten, 0, 0};
-  if (!engine->numeric_pairs || engine->store_config.extension)
-    return;
   for (size_t i = 0; i < engine->group_cap; i++)
     if (engine->groups[i].group_key) {
       store_t const *s = &engine->groups[i].store;
@@ -1426,11 +1428,6 @@ double bishfpm_pattern_rate(bishfpm_t *engine, const char *key,
                             const char *pattern, uint64_t now_ms) {
   store_result_t r;
   return query_pattern(engine, key, pattern, now_ms, &r) ? r.count.upper : 0;
-}
-
-double bishfpm_pattern_estimate(bishfpm_t *engine, const char *group,
-                                const char *pattern, uint64_t now_ms) {
-  return bishfpm_pattern_rate(engine, group, pattern, now_ms);
 }
 
 /* Retain numeric identities, but preserve legacy marginal forgetting/gating.

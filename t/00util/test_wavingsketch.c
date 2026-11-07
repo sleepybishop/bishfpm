@@ -337,7 +337,7 @@ static void alert(const char *group, const bishfpm_trigger_t *t, void *ctx) {
   bishfpm_count_bounds_t b;
   assert(bishfpm_pattern_bounds(e, group, t->pattern, t->timestamp, &b));
   assert(b.resident && !b.known && b.lower == 0 && isinf(b.upper));
-  close_to(bishfpm_pattern_estimate(e, group, t->pattern, t->timestamp),
+  close_to(bishfpm_pattern_rate(e, group, t->pattern, t->timestamp),
            t->pattern_rate);
 }
 static bishfpm_t *engine(bishfpm_config_t *c, bishfpm_wavingsketch_options_t *s,
@@ -356,10 +356,10 @@ static void engines(int dynamic) {
   s.buckets = 0; /* Config is owned after construction. */
   assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 3, alert, e) == 4);
   close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1.5);
-  close_to(bishfpm_pattern_estimate(e, "g", "a\037b", 0), 3);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 3);
   assert(bishfpm_add_event_weighted(e, "g", 1000, items, 3, 2, alert, e) == 4);
   assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 2, NULL, NULL) >= 0);
-  close_to(bishfpm_pattern_estimate(e, "g", "a\037b", 1000), 4.5);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 4.5);
   bishfpm_stats_t st;
   bishfpm_get_stats(e, &st);
   bishfpm_memory_stats_t m;
@@ -389,9 +389,9 @@ static void engines(int dynamic) {
   assert(bishfpm_group_rate(e, "g", 1000) == 0);
   assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
   assert(bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL) == -1);
-  close_to(bishfpm_pattern_estimate(e, "g", "a\037b", 0), 1);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 1);
   assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
-  close_to(bishfpm_pattern_estimate(e, "g", "a\037b", 0), 2);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 2);
   bishfpm_free(e);
 }
 static void confirmed_alert(const char *group, const bishfpm_trigger_t *t,
@@ -428,10 +428,10 @@ static void admission_evidence(int dynamic) {
    * evidence. */
   assert(bishfpm_add_event(e, "g", 0, n, 2, confirmed_alert, &alerts) == 0);
   snprintf(pattern, sizeof(pattern), "anchor\037%s", negative);
-  assert(bishfpm_pattern_estimate(e, "g", pattern, 0) == 3);
+  assert(bishfpm_pattern_rate(e, "g", pattern, 0) == 3);
   assert(bishfpm_add_event_weighted(e, "g", 0, n, 2, 2, confirmed_alert,
                                     &alerts) == 1);
-  assert(bishfpm_pattern_estimate(e, "g", pattern, 0) == 5);
+  assert(bishfpm_pattern_rate(e, "g", pattern, 0) == 5);
   /* At t=1000, evidence=1.5+1; the raw estimate is already 3.5. */
   assert(bishfpm_add_event(e, "g", 1000, n, 2, confirmed_alert, &alerts) == 0);
   assert(bishfpm_add_event(e, "g", 0, n, 2, confirmed_alert, &alerts) == 1);
@@ -511,9 +511,9 @@ static void failures(int dynamic) {
       rejected++;
       assert(bishfpm_group_rate(e, "g", 0) == 0);
       assert(bishfpm_add_event(e, "g", 0, items, 3, NULL, NULL) == 4);
-      close_to(bishfpm_pattern_estimate(e, "g", "a\037b", 0), 1);
+      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 1);
     } else
-      close_to(bishfpm_pattern_estimate(e, "g", "a\037b", 1000), 1);
+      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1);
     bishfpm_free(e);
   }
   assert(constructor_failures >= 8 && rejected >= 9);
