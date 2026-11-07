@@ -19,6 +19,7 @@ CORE_OBJ = \
 	lib/heavykeeper.o \
 	lib/uss.o \
 	lib/uss_pair.o \
+	lib/wavingsketch.o \
 	lib/bishfpm.o
 
 TEST_UTILS = \
@@ -44,7 +45,8 @@ TEST_UTILS = \
 	t/00util/test_store_plugin \
 	t/00util/test_heavykeeper \
 	t/00util/test_uss \
-	t/00util/test_uss_pair
+	t/00util/test_uss_pair \
+	t/00util/test_wavingsketch
 
 BENCH = \
 	t/00util/bench \
@@ -58,7 +60,8 @@ EXAMPLES = \
 	examples/store_plugin \
 	examples/heavykeeper \
 	examples/uss \
-	examples/uss_pair
+	examples/uss_pair \
+	examples/wavingsketch
 
 all: libraries $(TEST_UTILS) $(BENCH) $(EXAMPLES)
 
@@ -75,6 +78,21 @@ lib/%.o: lib/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 # Assertions execute test and benchmark checks, even with release library flags.
+t/00util/bench_engines: t/00util/bench_engines.c t/00util/store_twins.c t/00util/store_twins.h libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< t/00util/store_twins.c libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
+
+t/00util/test_store_plugin: t/00util/test_store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
+t/00util/test_wavingsketch: t/00util/test_wavingsketch.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
+t/00util/test_uss: t/00util/test_uss.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
+t/00util/test_heavykeeper: t/00util/test_heavykeeper.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
 t/00util/test_rejections: t/00util/test_rejections.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
 
@@ -84,23 +102,11 @@ t/00util/test_dynamic: t/00util/test_dynamic.c libbishfpm.a
 t/00util/test_pressure: t/00util/test_pressure.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=calloc $(LDLIBS) -UNDEBUG -o $@
 
-t/00util/bench_engines: t/00util/bench_engines.c t/00util/store_twins.c t/00util/store_twins.h libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< t/00util/store_twins.c libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
-
-t/00util/test_store_plugin: t/00util/test_store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
-
-t/00util/test_uss: t/00util/test_uss.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
-
-t/00util/test_heavykeeper: t/00util/test_heavykeeper.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+t/00util/%: t/00util/%.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
 
 examples/store_plugin: examples/store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@
-
-t/00util/%: t/00util/%.c libbishfpm.a
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
 
 examples/%: examples/%.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@

@@ -90,6 +90,8 @@ ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
   -I"$stage/usr/include" -c lib/uss.c -o "$stage/uss-backend.o"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/wavingsketch.c -o "$stage/wavingsketch-backend.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
   -I"$stage/usr/include" -c lib/uss_pair.c -o "$stage/uss-pair-backend.o"
 version=$(PKG_CONFIG_LIBDIR="$stage/usr/lib/pkgconfig" pkg-config --modversion bishfpm)
 run_compiler() {
@@ -142,6 +144,10 @@ for language in c c++; do
       -I"$stage/usr/include" examples/uss_pair.c \
       -x none "$library" -lm -o "$stage/uss_pair"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/uss_pair"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/wavingsketch.c \
+      -x none "$library" -lm -o "$stage/wavingsketch"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/wavingsketch"
   done
 done
 test ! -e "$stage/usr/include/internal.h"

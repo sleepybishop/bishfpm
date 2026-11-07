@@ -11,14 +11,22 @@ callgrind.*
 perf.data*
 build/
 examples/stream_tsv
-examples/store_plugin
-examples/heavykeeper
-examples/uss
-examples/uss_pair
 t/00util/*
 !t/00util/*.c
-!t/00util/*.h
 
 libbishfpm.so.*
 bishfpm.pc
 __pycache__/
+
+!t/00util/*.h
+examples/store_plugin
+
+examples/heavykeeper
+
+examples/uss
+examples/wavingsketch
+
+!t/00util/*.cpp
+!t/00util/*.hpp
+
+examples/uss_pair
