@@ -81,6 +81,18 @@ int main(void) {
          strcmp(BISHFPM_VERSION_STRING, EXPECT_VERSION);
 }
 C
+# Compile the backend using only staged public headers, outside the checkout.
+cp examples/exact_store.c examples/exact_store.h examples/store_plugin.c "$stage/"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors -UNDEBUG \
+  -I"$stage/usr/include" -I"$stage" -c "$stage/exact_store.c" -o "$stage/exact_store.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/heavykeeper.c -o "$stage/heavykeeper-backend.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/uss.c -o "$stage/uss-backend.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/wavingsketch.c -o "$stage/wavingsketch-backend.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/uss_pair.c -o "$stage/uss-pair-backend.o"
 version=$(PKG_CONFIG_LIBDIR="$stage/usr/lib/pkgconfig" pkg-config --modversion bishfpm)
 run_compiler() {
   # CC/CXX are shell commands, as in make; keep consumer arguments positional.
@@ -116,13 +128,36 @@ for language in c c++; do
       -UNDEBUG -I"$stage/usr/include" t/00util/test_lowlevel.c \
       -x none "$library" -lm -o "$stage/lowlevel"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/lowlevel"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" -I"$stage" "$stage/store_plugin.c" \
+      -x none "$stage/exact_store.o" "$library" -lm -o "$stage/plugin"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/plugin"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/heavykeeper.c \
+      -x none "$library" -lm -o "$stage/heavykeeper"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/heavykeeper"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/uss.c \
+      -x none "$library" -lm -o "$stage/uss"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/uss"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/uss_pair.c \
+      -x none "$library" -lm -o "$stage/uss_pair"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/uss_pair"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/wavingsketch.c \
+      -x none "$library" -lm -o "$stage/wavingsketch"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/wavingsketch"
   done
 done
 test ! -e "$stage/usr/include/internal.h"
 test ! -e "$stage/usr/include/state.h"
+test ! -e "$stage/usr/include/store.h"
+test ! -e "$stage/usr/include/store_plugin.h"
+test ! -e "$stage/usr/include/plugin_common.h"
 if nm -D --defined-only "$stage/usr/lib/libbishfpm.so" | \
     awk '{print $3}' | \
-    grep -Eq '^(topk_add_result|topk_add_sized|topk_query_result|rate_table_find|rate_table_new_budget|rate_table_prepare_result|arena_new_budget|bishfpm_arena_init|compact_.*)$'; then
+    grep -Eq '^(topk_add_result|topk_add_sized|topk_query_result|rate_table_find|rate_table_new_budget|rate_table_prepare_result|arena_new_budget|bishfpm_arena_init|compact_.*|store_.*)$'; then
   printf 'Private helper exported from shared library\n' >&2
   exit 1
 fi

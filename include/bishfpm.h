@@ -101,7 +101,8 @@ typedef struct {
                                           */
   char formatted[BISHFPM_MAX_PATTERN_LEN]; /* human readable comma-separated
                                               string */
-  double pattern_rate;        /* conservative decayed pattern count */
+  double pattern_rate;        /* conservative count; heuristic plugins use their
+                                 estimate or admission evidence per capability */
   double pattern_upper_bound; /* decayed pattern upper bound */
   double pattern_error;       /* upper minus conservative pattern_rate */
   double group_rate;          /* current decayed group count */
@@ -157,7 +158,8 @@ bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg);
  * THRESHOLD requires disabled marginal gates. In surviving groups it only
  * forgets patterns whose upper bound <= forget_below; saturation rejects the
  * whole event before count mutation. No offline prepass or future vocabulary
- * is used. */
+ * is used. A zero forgetting floor uses compact exact counts and reclaims
+ * only counts that decay to zero. */
 typedef enum {
   BISHFPM_PAIR_SS = 0,
   BISHFPM_PAIR_THRESHOLD = 1,
@@ -224,6 +226,7 @@ double bishfpm_item_rate(bishfpm_t *engine, const char *group_key,
                          const char *item, uint64_t now_ms);
 
 /* Query the pattern upper estimate at now_ms, clamped to the group watermark.
+ * Explicit heuristic plugins return an uncertified estimate instead.
  * Use bishfpm_pattern_bounds to distinguish unknown absence from zero support.
  */
 double bishfpm_pattern_rate(bishfpm_t *engine, const char *group_key,
@@ -235,9 +238,9 @@ double bishfpm_pattern_rate(bishfpm_t *engine, const char *group_key,
  * identities/counts intact; returns the number forgotten. Missing groups,
  * general-itemset stores, zero budget and reentrant calls are no-ops.
  * Timestamps advance the group clock; late input is discounted. Bounds
- * removals, not wall-clock time: hash probes/heap movement vary in cost.
- * Threshold ingestion may still bulk-prune to reserve capacity for a complete
- * event. */
+ * removals, not wall-clock time: hash probes, scans and heap movement vary in
+ * cost. Threshold ingestion may still bulk-prune to reserve capacity for a
+ * complete event. */
 size_t bishfpm_prune_pairs(bishfpm_t *, const char *group_key, uint64_t now_ms,
                            size_t max_pairs);
 

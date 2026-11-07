@@ -16,6 +16,9 @@ itemset order limits the combinations considered.
 | --- | --- | --- |
 | Metwally, Agrawal and El Abbadi, SpaceSaving [4] | Minimum-counter replacement with inherited admission error | Weighted string itemsets or numeric pairs, elapsed-time decay, and pruning that preserves omitted-history bounds. Intervals cover evaluated candidates; gates censor history and true top-k ranking is not guaranteed. |
 | Homem and Carvalho, Filtered SpaceSaving [14]; the [`topk` 0.7.0 reference implementation](https://docs.rs/topk/0.7.0/src/topk/topk/mod.rs.html) | Bucket history filters misses before minimum-counter replacement | String itemsets or numeric pairs, decayed bucket bounds, weighted/late updates, and history-preserving pruning. Bounds cover evaluated candidates; disable both marginal gates for full transaction history. |
+| Gong et al., HeavyKeeper [15] | Fingerprint sketch with exponential-decay collision trials and min-heap tracking | Experimental EWMA-decayed text plugin (`bishfpm_heavykeeper_store`) with geometric skips for integer weights, single Bernoulli trial for fractional remainders, and uncertified heuristic estimates. |
+| Ting, Unbiased Space-Saving [16] | Streamline replacement retaining incoming key with probability $w / (c_{\min} + w)$ | Experimental weighted EWMA text and pair plugins (`bishfpm_uss_store`, `bishfpm_uss_pair_store`) with separate matching-update admission evidence for alerting. |
+| Li et al., WavingSketch [17] | Bucket-local heavy cells coupled with a signed Count-Sketch wave counter | Experimental weighted EWMA text plugin (`bishfpm_wavingsketch_store`) with independent per-cell evidence timestamps for alerting. |
 
 ## Related work
 
@@ -75,3 +78,9 @@ concentration and explanations.
 [13] R. Miao, Z. Zhong, J. Guo, Z. Li, T. Yang, and B. Cui. BurstSketch: Finding Bursts in Data Streams. *IEEE Transactions on Knowledge and Data Engineering (TKDE)*, 35(11):11126–11140, 2023. [https://doi.org/10.1109/TKDE.2022.3223686](https://doi.org/10.1109/TKDE.2022.3223686)
 
 [14] N. Homem and J. P. Carvalho. Finding top-k elements in data streams. *Information Sciences*, 180(24):4958–4974, 2010. [https://doi.org/10.1016/j.ins.2010.08.024](https://doi.org/10.1016/j.ins.2010.08.024)
+
+[15] J. Gong, T. Yang, H. Zhang, H. Li, S. Uhlig, S. Chen, L. Uden, and X. Li. HeavyKeeper: An Accurate Algorithm for Finding Top-k Elephant Flows. In *Proceedings of the 2018 USENIX Annual Technical Conference (USENIX ATC)*, pages 909–921, 2018. [https://www.usenix.org/conference/atc18/presentation/gong](https://www.usenix.org/conference/atc18/presentation/gong)
+
+[16] D. Ting. Data Sketches for Disaggregated Subset Sum and Frequent Item Estimation. In *Proceedings of the 2018 International Conference on Management of Data (SIGMOD)*, pages 1129–1140, 2018. [https://doi.org/10.1145/3183713.3183759](https://doi.org/10.1145/3183713.3183759)
+
+[17] J. Li, Z. Li, Y. Xu, S. Jiang, T. Yang, B. Cui, Y. Dai, and G. Zhang. WavingSketch: An Unbiased and Generic Sketch for Finding Top-k Items in Data Streams. In *Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining*, pages 1574–1584, 2020. [https://doi.org/10.1145/3394486.3403208](https://doi.org/10.1145/3394486.3403208)

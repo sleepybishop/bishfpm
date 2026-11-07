@@ -1,4 +1,7 @@
-#include "bishfpm.h"
+#include "bishfpm_heavykeeper.h"
+#include "bishfpm_uss.h"
+#include "bishfpm_wavingsketch.h"
+#include "examples/exact_store.h"
 #include <assert.h>
 #include <math.h>
 #include <stddef.h>
@@ -6,16 +9,16 @@
 #include <string.h>
 static void alert(const char *g, const bishfpm_trigger_t *t, void *ud) {
   (void)g;
-  (void)ud;
+  int heuristic = ud ? *(const int *)ud : 0;
   assert(isfinite(t->pattern_rate) && isfinite(t->group_rate));
-  assert(t->pattern_rate >= 0 && t->rate_fraction <= 1.000001);
+  assert(t->pattern_rate >= 0 && (heuristic || t->rate_fraction <= 1.000001));
   assert(memchr(t->pattern, 0, sizeof(t->pattern)));
 }
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (!size)
     return 0;
   unsigned selector = *data++;
-  unsigned store = selector % 5;
+  unsigned store = selector % 10;
   size--;
   bishfpm_config_t c;
   bishfpm_config_default(&c);
@@ -36,7 +39,43 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     c.max_memory_bytes = 64U << 10;
   }
   bishfpm_t *e;
-  if (store >= 2) {
+  if (store == 9) {
+    bishfpm_wavingsketch_options_t settings = {3, 2};
+    bishfpm_store_engine_options_t options;
+    bishfpm_store_engine_options_default(&options);
+    options.memory_mode = engine_options.memory_mode;
+    options.notification_capacity = c.topk_k;
+    e = bishfpm_create_with_store(&c, &options, &bishfpm_wavingsketch_store,
+                                  &settings, sizeof(settings));
+  } else if (store == 8) {
+    bishfpm_uss_options_t settings = {8, selector};
+    bishfpm_store_engine_options_t options;
+    bishfpm_store_engine_options_default(&options);
+    options.memory_mode = engine_options.memory_mode;
+    options.notification_capacity = c.topk_k;
+    e = bishfpm_create_with_store(&c, &options, &bishfpm_uss_store, &settings,
+                                  sizeof(settings));
+  } else if (store == 7) {
+    bishfpm_heavykeeper_options_t settings = {8, 1, 3, .95};
+    bishfpm_store_engine_options_t options;
+    bishfpm_store_engine_options_default(&options);
+    options.memory_mode = engine_options.memory_mode;
+    options.notification_capacity = c.topk_k;
+    e = bishfpm_create_with_store(&c, &options, &bishfpm_heavykeeper_store,
+                                  &settings, sizeof(settings));
+  } else if (store >= 5) {
+    if (store == 6)
+      c.min_itemset_order = c.max_itemset_order = 2;
+    exact_store_options_t backend = {
+        16, store == 5 ? BISHFPM_STORE_TEXT : BISHFPM_STORE_PAIR64, "fuzz"};
+    bishfpm_store_engine_options_t options;
+    bishfpm_store_engine_options_default(&options);
+    options.memory_mode = engine_options.memory_mode;
+    options.notification_capacity = c.topk_k;
+    e = bishfpm_create_with_store(
+        &c, &options, store == 5 ? &exact_text_store : &exact_pair_store,
+        &backend, sizeof(backend));
+  } else if (store >= 2) {
     c.min_itemset_order = c.max_itemset_order = 2;
     bishfpm_pair_options_t options = {store == 2   ? BISHFPM_PAIR_SS
                                       : store == 3 ? BISHFPM_PAIR_THRESHOLD
@@ -52,6 +91,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   }
   if (!e)
     return 0;
+  int heuristic = store >= 7;
   uint64_t t = 0;
   while (size >= 4) {
     unsigned op = data[0], n = data[1] % 9, w = data[2];
@@ -78,7 +118,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       bishfpm_prune(e, event_time, .01);
     else
       bishfpm_add_event_weighted(e, group, event_time, items, n, w, alert,
-                                 NULL);
+                                 &heuristic);
     bishfpm_stats_t st;
     bishfpm_get_stats(e, &st);
     assert(st.memory_current_bytes <= st.memory_bound_bytes);
@@ -95,9 +135,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     bishfpm_rejection_stats_t reasons;
     bishfpm_get_rejection_stats(e, &reasons);
     assert(reasons.invalid_input + reasons.event_items_limit +
-           reasons.pattern_length_limit + reasons.candidate_limit +
-           reasons.group_limit + reasons.marginal_limit +
-           reasons.allocation_failure + reasons.reentrant == st.events_rejected);
+               reasons.pattern_length_limit + reasons.candidate_limit +
+               reasons.group_limit + reasons.marginal_limit +
+               reasons.allocation_failure + reasons.reentrant ==
+           st.events_rejected);
   }
   bishfpm_free(e);
   return 0;
