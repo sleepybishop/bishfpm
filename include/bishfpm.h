@@ -157,7 +157,8 @@ bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg);
  * THRESHOLD requires disabled marginal gates. In surviving groups it only
  * forgets patterns whose upper bound <= forget_below; saturation rejects the
  * whole event before count mutation. No offline prepass or future vocabulary
- * is used. */
+ * is used. A zero forgetting floor uses compact exact counts and reclaims
+ * only counts that decay to zero. */
 typedef enum {
   BISHFPM_PAIR_SS = 0,
   BISHFPM_PAIR_THRESHOLD = 1,

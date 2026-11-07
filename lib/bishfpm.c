@@ -229,7 +229,8 @@ static bool validate_pairs(const bishfpm_config_t *cfg,
   if (!isfinite(pairs->forget_below) || pairs->forget_below < 0)
     return false;
   /* validate the store layout even when dynamic budgeting defers allocation */
-  if (!compact_bytes(pairs->capacity, pairs->sketch_width, pairs->store))
+  if (!compact_configured_bytes(pairs->capacity, pairs->sketch_width,
+                                pairs->store, pairs->forget_below))
     return false;
 
   switch (pairs->store) {
@@ -257,7 +258,8 @@ static size_t memory_bound(const bishfpm_config_t *c,
                               &layout))
     return SIZE_MAX;
   size_t pair_bytes =
-      pairs ? compact_bytes(pairs->capacity, pairs->sketch_width, pairs->store)
+      pairs ? compact_configured_bytes(pairs->capacity, pairs->sketch_width,
+                                       pairs->store, pairs->forget_below)
             : 0;
   if (pairs && !pair_bytes)
     return SIZE_MAX;
@@ -1353,7 +1355,7 @@ void bishfpm_get_pair_stats(const bishfpm_t *engine,
     if (engine->groups[i].group_key && engine->groups[i].pairs) {
       compact_t *p = engine->groups[i].pairs;
       out->resident_pairs += p->heap_size;
-      out->store_bytes += compact_bytes(p->k, p->sketch_width, p->kind);
+      out->store_bytes += compact_storage_bytes(p);
     }
 }
 
@@ -1658,8 +1660,7 @@ void bishfpm_get_stats(const bishfpm_t *engine, bishfpm_stats_t *out) {
         g->cooldown_cap *
             (cooldown_entry_size(g->pairs != NULL) + 2 * sizeof(uint32_t));
     if (g->pairs)
-      out->memory_current_bytes +=
-          compact_bytes(g->pairs->k, g->pairs->sketch_width, g->pairs->kind);
+      out->memory_current_bytes += compact_storage_bytes(g->pairs);
     if (g->topk && !g->topk->arena_backed)
       out->memory_current_bytes += bishfpm_topk_storage_bytes(g->topk);
     out->memory_current_bytes += g->item_rates->key_bytes;

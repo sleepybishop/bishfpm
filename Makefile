@@ -29,6 +29,7 @@ TEST_UTILS = \
 	t/00util/test_regressions \
 	t/00util/test_lowlevel \
 	t/00util/test_pairs \
+	t/00util/test_compact_exact \
 	t/00util/test_online \
 	t/00util/test_fss \
 	t/00util/test_rejections \
