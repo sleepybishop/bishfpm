@@ -7,6 +7,20 @@ static int slot_map_find(const compact_t *store, uint64_t key, uint64_t hash,
                          uint32_t *out_idx) {
   size_t mask = store->slot_map_cap - 1;
   size_t idx = (size_t)(hash & mask);
+  if (store->exact) {
+    for (size_t i = 0; i < store->slot_map_cap; i++) {
+      size_t s = (idx + i) & mask;
+      if (!store->slot_map[s])
+        return 0;
+      uint32_t index = store->slot_map[s] - 1;
+      if (store->counts[index].key == key) {
+        if (out_idx)
+          *out_idx = index;
+        return 1;
+      }
+    }
+    return 0;
+  }
 
   for (size_t i = 0; i < store->slot_map_cap; i++) {
     size_t s = (idx + i) & mask;
@@ -66,7 +80,11 @@ static void slot_map_remove(compact_t *store, uint64_t hash,
     if (!store->slot_map[k]) {
       break;
     }
-    size_t orig = (size_t)(store->heap[store->slot_map[k] - 1].hash & mask);
+    uint32_t index = store->slot_map[k] - 1;
+    uint64_t resident_hash = store->exact
+                                 ? compact_hash(store->counts[index].key)
+                                 : store->heap[index].hash;
+    size_t orig = (size_t)(resident_hash & mask);
     bool can_move = false;
     if (j <= k) {
       can_move = (orig <= j || orig > k);
@@ -82,7 +100,9 @@ static void slot_map_remove(compact_t *store, uint64_t hash,
 }
 
 static size_t slot_for_index(const compact_t *store, uint32_t index) {
-  size_t slot = store->heap[index].hash & (store->slot_map_cap - 1);
+  uint64_t hash = store->exact ? compact_hash(store->counts[index].key)
+                               : store->heap[index].hash;
+  size_t slot = hash & (store->slot_map_cap - 1);
   while (store->slot_map[slot] != index + 1)
     slot = (slot + 1) & (store->slot_map_cap - 1);
   return slot;
@@ -90,8 +110,11 @@ static size_t slot_for_index(const compact_t *store, uint32_t index) {
 
 static void slot_map_rebuild(compact_t *store) {
   memset(store->slot_map, 0, store->slot_map_cap * sizeof(*store->slot_map));
-  for (uint32_t i = 0; i < store->heap_size; i++)
-    slot_map_set(store, store->heap[i].hash, i);
+  for (uint32_t i = 0; i < store->heap_size; i++) {
+    uint64_t hash =
+        store->exact ? compact_hash(store->counts[i].key) : store->heap[i].hash;
+    slot_map_set(store, hash, i);
+  }
 }
 
 static inline double item_rate(const compact_entry_t *item, uint64_t now_ms,
@@ -209,6 +232,22 @@ size_t compact_bytes(uint32_t k, uint32_t width, bishfpm_pair_store_t kind) {
     return 0;
   return bytes;
 }
+size_t compact_configured_bytes(uint32_t k, uint32_t width,
+                                bishfpm_pair_store_t kind, double floor) {
+  size_t bytes = compact_bytes(k, width, kind);
+  if (bytes && kind == BISHFPM_PAIR_THRESHOLD && floor == 0)
+    bytes -=
+        (size_t)k * (sizeof(compact_entry_t) - sizeof(compact_exact_entry_t));
+  return bytes;
+}
+size_t compact_storage_bytes(const compact_t *t) {
+  return t ? sizeof(*t) +
+                 (size_t)t->k *
+                     (t->exact ? sizeof(*t->counts) : sizeof(*t->heap)) +
+                 t->slot_map_cap * sizeof(*t->slot_map) +
+                 (size_t)t->sketch_width * sizeof(*t->sketch)
+           : 0;
+}
 compact_t *compact_new(uint32_t k, double half, uint32_t width,
                        bishfpm_pair_store_t kind, double floor) {
   return compact_new_budget(k, half, width, kind, floor, NULL);
@@ -227,8 +266,12 @@ compact_t *compact_new_budget(uint32_t k, double half, uint32_t width,
   t->sketch_width = width;
   t->kind = kind;
   t->forget_below = floor;
+  t->exact = kind == BISHFPM_PAIR_THRESHOLD && floor == 0;
   t->slot_map_cap = next_pow2((size_t)k * 2);
-  t->heap = memory_calloc(budget, k, sizeof(*t->heap));
+  if (t->exact)
+    t->counts = memory_calloc(budget, k, sizeof(*t->counts));
+  else
+    t->heap = memory_calloc(budget, k, sizeof(*t->heap));
   if (!t->heap) {
     compact_free(t);
     return NULL;
@@ -244,7 +287,9 @@ compact_t *compact_new_budget(uint32_t k, double half, uint32_t width,
 }
 void compact_free(compact_t *t) {
   if (t) {
-    memory_free(t->budget, t->heap, t->k * sizeof(*t->heap));
+    memory_free(t->budget, t->heap,
+                (size_t)t->k *
+                    (t->exact ? sizeof(*t->counts) : sizeof(*t->heap)));
     memory_free(t->budget, t->slot_map, t->slot_map_cap * sizeof(*t->slot_map));
     memory_free(t->budget, t->sketch, t->sketch_width * sizeof(*t->sketch));
     memory_free(t->budget, t, sizeof(*t));
@@ -296,6 +341,7 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
         decay_since(entry->error, entry->last_time_ms, now, t->half_life_ms);
     entry->rate = rate + weight;
     entry->last_time_ms = now;
+    r.accepted = true;
     r.present = r.was_present = true;
     r.time_ms = now;
     r.upper = entry->rate;
@@ -318,6 +364,7 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
     return r;
 
   fss_advance(t, now, total + weight);
+  r.accepted = true;
   r.time_ms = now;
   if (full && alpha + weight < minimum) {
     bishfpm_sketch_cell_t *cell = &t->sketch[fss_bucket(t, hash)];
@@ -351,6 +398,92 @@ static topk_result_t fss_add(compact_t *t, uint64_t key, uint64_t hash,
   return r;
 }
 
+/* track raw minima and timestamps separately so direct decay of this lower
+ * envelope is conservative without repeated rounding drift */
+static void exact_minimum(compact_t *t, double rate, uint64_t timestamp,
+                          bool first) {
+  if (first || rate < t->sketch_total)
+    t->sketch_total = rate;
+  if (first || timestamp < t->exact_min_time_ms)
+    t->exact_min_time_ms = timestamp;
+}
+static inline double exact_rate(const compact_t *t, uint32_t index,
+                                uint64_t now) {
+  const compact_exact_entry_t *e = &t->counts[index];
+  return decay_since(e->rate, e->last_time_ms, now, t->half_life_ms);
+}
+static bool exact_all_positive(const compact_t *t, uint64_t now) {
+  return !t->heap_size || decay_since(t->sketch_total, t->exact_min_time_ms,
+                                      now, t->half_life_ms) > 0;
+}
+static topk_result_t exact_add(compact_t *t, uint64_t key, uint64_t hash,
+                               double increment, uint64_t timestamp) {
+  assert(hash == compact_hash(key));
+  topk_result_t r = {0};
+  uint64_t now = effective_time(timestamp, t->max_time_ms);
+  double weight = decay_since(increment, timestamp, now, t->half_life_ms);
+  r.time_ms = now;
+  uint32_t index;
+  bool found = slot_map_find(t, key, hash, &index);
+  r.was_present = found;
+  double count = found ? exact_rate(t, index, now) : 0;
+  if ((!found && t->heap_size == t->k) || weight > DBL_MAX - count)
+    return r;
+  bool first = !t->heap_size;
+  if (!found) {
+    index = t->heap_size++;
+    slot_map_set(t, hash, index);
+  }
+  t->counts[index] = (compact_exact_entry_t){key, count + weight, now};
+  exact_minimum(t, count + weight, now, first);
+  t->max_time_ms = now;
+  r.accepted = true;
+  r.present = true;
+  r.lower = r.upper = count + weight;
+  return r;
+}
+/* dense deletion repairs the moved row's index; bulk removals rebuild the map
+ */
+static size_t exact_prune(compact_t *t, uint64_t now, size_t limit) {
+  t->max_time_ms = now;
+  if (exact_all_positive(t, now))
+    return 0;
+  size_t removed = 0;
+  size_t indexed_limit = limit < 1024 ? limit : 1024;
+  uint32_t i = 0;
+  while (i < t->heap_size && removed < indexed_limit) {
+    if (exact_rate(t, i, now) > 0) {
+      i++;
+      continue;
+    }
+    slot_map_remove(t, compact_hash(t->counts[i].key), i);
+    uint32_t last = --t->heap_size;
+    if (i != last) {
+      size_t slot = slot_for_index(t, last);
+      t->counts[i] = t->counts[last];
+      t->slot_map[slot] = i + 1;
+    }
+    removed++;
+  }
+  while (i < t->heap_size && removed < limit) {
+    if (exact_rate(t, i, now) > 0) {
+      i++;
+      continue;
+    }
+    uint32_t last = --t->heap_size;
+    if (i != last)
+      t->counts[i] = t->counts[last];
+    removed++;
+  }
+  if (removed > indexed_limit)
+    slot_map_rebuild(t);
+  /* refresh the lower envelope even when no zero was found */
+  for (uint32_t j = 0; j < t->heap_size; j++)
+    exact_minimum(t, t->counts[j].rate, t->counts[j].last_time_ms, j == 0);
+  t->forgotten += removed;
+  return removed;
+}
+
 topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
                           double increment, uint64_t now_ms) {
   topk_result_t result = {0};
@@ -358,6 +491,8 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
     return result;
   if (increment == 0.0)
     return compact_query(store, key, hash, now_ms);
+  if (store->exact)
+    return exact_add(store, key, hash, increment, now_ms);
   if (store->kind == BISHFPM_PAIR_FSS)
     return fss_add(store, key, hash, increment, now_ms);
   uint64_t timestamp = now_ms;
@@ -380,6 +515,7 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
                               store->half_life_ms);
     item->rate = decayed + weight;
     item->last_time_ms = now_ms;
+    result.accepted = true;
     result.present = true;
     result.upper = item->rate;
     result.lower = fmax(0, item->rate - item->error);
@@ -411,6 +547,7 @@ topk_result_t compact_add(compact_t *store, uint64_t key, uint64_t hash,
   item->rate = error + weight;
   item->error = error;
   item->last_time_ms = now_ms;
+  result.accepted = true;
   result.present = true;
   result.replaced = replacing;
   result.upper = item->rate;
@@ -434,10 +571,15 @@ topk_result_t compact_query(const compact_t *store, uint64_t key, uint64_t hash,
   if (!slot_map_find(store, key, hash, &idx)) {
     if (store->kind == BISHFPM_PAIR_FSS)
       result.upper = result.error = fss_alpha(store, hash, result.time_ms);
-    if (store->kind == BISHFPM_PAIR_THRESHOLD)
+    if (store->kind == BISHFPM_PAIR_THRESHOLD && !store->exact)
       result.upper = result.error =
           decay_since(store->omitted_bound, store->max_time_ms, result.time_ms,
                       store->half_life_ms);
+    return result;
+  }
+  if (store->exact) {
+    result.present = result.was_present = true;
+    result.lower = result.upper = exact_rate(store, idx, result.time_ms);
     return result;
   }
   const compact_entry_t *item = &store->heap[idx];
@@ -482,6 +624,8 @@ size_t compact_prune_bounded(compact_t *store, uint64_t now_ms, size_t limit) {
   if (!store || !limit || !store->heap_size)
     return 0;
   now_ms = effective_time(now_ms, store->max_time_ms);
+  if (store->exact)
+    return exact_prune(store, now_ms, limit);
   store->omitted_bound = bishfpm_rate_decay(
       store->omitted_bound, now_ms - store->max_time_ms, store->half_life_ms);
   store->sketch_total = bishfpm_rate_decay(
@@ -503,6 +647,8 @@ size_t compact_prune(compact_t *store, uint64_t now_ms, double min_rate) {
   if (threshold)
     min_rate = fmin(min_rate, store->forget_below);
   now_ms = effective_time(now_ms, store->max_time_ms);
+  if (store->exact)
+    return exact_prune(store, now_ms, SIZE_MAX);
   store->omitted_bound = bishfpm_rate_decay(
       store->omitted_bound, now_ms - store->max_time_ms, store->half_life_ms);
   store->sketch_total = bishfpm_rate_decay(
@@ -574,21 +720,45 @@ bool compact_reserve(const compact_t *t, const uint32_t *ids, size_t n,
   size_t pairs = n * (n - 1) / 2;
   if (pairs > t->k)
     return false;
+  size_t free_slots = t->k - t->heap_size;
+  if (pairs <= free_slots)
+    return true;
   now = effective_time(now, t->max_time_ms);
-  size_t missing = 0, event_strong = 0;
+  size_t missing = 0, found = 0, event_strong = 0;
+  bool all_positive = t->exact && exact_all_positive(t, now);
   for (size_t i = 0; i < n; i++)
     for (size_t j = i + 1; j < n; j++) {
       uint64_t key = compact_key(ids[i], ids[j]);
       uint32_t idx;
-      if (!slot_map_find(t, key, compact_hash(key), &idx))
+      if (!slot_map_find(t, key, compact_hash(key), &idx)) {
         missing++;
-      else if (item_rate(&t->heap[idx], now, t->half_life_ms) > t->forget_below)
-        event_strong++;
+        /* with no reclaimable resident, this already proves rejection */
+        if (all_positive && missing > free_slots)
+          return false;
+      } else {
+        found++;
+        if (pairs - found <= free_slots)
+          return true;
+        if (all_positive ||
+            (t->exact ? exact_rate(t, idx, now)
+                      : item_rate(&t->heap[idx], now, t->half_life_ms)) >
+                t->forget_below)
+          event_strong++;
+      }
     }
-  if (missing <= t->k - t->heap_size)
+  if (missing <= free_slots)
     return true;
-  size_t needed = pairs - event_strong - (t->k - t->heap_size);
-  if (weak_count(t, 0, now, needed) < needed)
+  size_t needed = pairs - event_strong - free_slots;
+  if (t->exact) {
+    if (all_positive)
+      return false;
+    size_t weak = 0;
+    for (uint32_t i = 0; i < t->heap_size && weak < needed; i++)
+      if (exact_rate(t, i, now) == 0)
+        weak++;
+    if (weak < needed)
+      return false;
+  } else if (weak_count(t, 0, now, needed) < needed)
     return false;
   *prune = true;
   return true;

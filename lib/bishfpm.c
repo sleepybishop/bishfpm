@@ -1,6 +1,6 @@
 #include "bishfpm.h"
-#include "compact.h"
 #include "internal.h"
+#include "store_plugin.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,9 +82,7 @@ typedef struct {
   uint64_t hash;
   bishfpm_rate_t group_rate;
   bishfpm_rate_table_t *item_rates;
-  bishfpm_topk_t *topk;
-  compact_t *pairs;
-  bishfpm_arena_t *arena;
+  store_t store;
   void *cooldowns;
   size_t cooldown_cap, cooldown_count;
   /* Lower bound on the oldest trigger; refreshed during maintenance. */
@@ -111,7 +109,7 @@ struct bishfpm {
   bishfpm_options_t options;
   bishfpm_memory_budget_t memory;
   bool numeric_pairs;
-  bishfpm_pair_options_t pair_options;
+  store_config_t store_config;
   uint64_t pair_capacity_rejections, pairs_forgotten;
   bishfpm_group_t *groups;
   size_t group_cap;
@@ -222,47 +220,16 @@ static bool validate_config(const bishfpm_config_t *c) {
   return true;
 }
 
-static bool validate_pairs(const bishfpm_config_t *cfg,
-                           const bishfpm_pair_options_t *pairs) {
-  if (cfg->min_itemset_order != 2 || cfg->max_itemset_order != 2)
-    return false;
-  if (!isfinite(pairs->forget_below) || pairs->forget_below < 0)
-    return false;
-  /* validate the store layout even when dynamic budgeting defers allocation */
-  if (!compact_bytes(pairs->capacity, pairs->sketch_width, pairs->store))
-    return false;
-
-  switch (pairs->store) {
-  case BISHFPM_PAIR_SS:
-    return pairs->sketch_width == 0;
-  case BISHFPM_PAIR_THRESHOLD:
-    return pairs->sketch_width == 0 && cfg->item_rate_threshold == 0 &&
-           cfg->item_share_threshold == 0;
-  case BISHFPM_PAIR_FSS:
-    return pairs->sketch_width != 0;
-  default:
-    return false;
-  }
-}
-
 /* Upper bound on library-requested payload, including concurrent old/new
  * tables during reservation, pruning and cooldown growth; allocator overhead
  * and caller buffers are outside this budget. Limits above bound each factor.
  */
 static size_t memory_bound(const bishfpm_config_t *c,
-                           const bishfpm_pair_options_t *pairs,
-                           uint32_t sketch_width) {
-  topk_layout_t layout;
-  if (!topk_layout_configured(c->topk_k, c->ewma_half_life_ms, sketch_width,
-                              &layout))
+                           const store_config_t *store) {
+  size_t store_bytes = store->ops->bytes(store);
+  if (store_bytes == SIZE_MAX)
     return SIZE_MAX;
-  size_t pair_bytes =
-      pairs ? compact_bytes(pairs->capacity, pairs->sketch_width, pairs->store)
-            : 0;
-  if (pairs && !pair_bytes)
-    return SIZE_MAX;
-  if (pairs)
-    layout.arena_bytes = 0;
+  size_t slot_cap = next_pow2((size_t)c->topk_k * 2);
   size_t rate_cap = next_pow2((size_t)c->max_items_per_group * 2);
   if (rate_cap < INITIAL_MARGINAL_CAPACITY)
     rate_cap = INITIAL_MARGINAL_CAPACITY;
@@ -272,29 +239,38 @@ static size_t memory_bound(const bishfpm_config_t *c,
   size_t staged = c->max_event_items < c->max_items_per_group
                       ? c->max_event_items
                       : c->max_items_per_group;
-  size_t cooldown_cap = layout.slot_cap > COOLDOWN_GROWTH_LIMIT
-                            ? layout.slot_cap
-                            : COOLDOWN_GROWTH_LIMIT;
+  size_t cooldown_cap =
+      slot_cap > COOLDOWN_GROWTH_LIMIT ? slot_cap : COOLDOWN_GROWTH_LIMIT;
   /* Include simultaneous old/new tables, all final key copies and the
    * bounded staging array. Pruning/growth never exceeds these capacities. */
   uint64_t per_group =
       BISHFPM_MAX_GROUP_KEY_LEN + sizeof(bishfpm_rate_table_t) +
-      (pairs ? 0 : sizeof(bishfpm_arena_t)) + layout.arena_bytes + pair_bytes +
       2 * (uint64_t)rate_cap * sizeof(bishfpm_rate_entry_t) +
       (uint64_t)c->max_items_per_group * BISHFPM_MAX_ITEM_LEN +
       (uint64_t)staged * sizeof(bishfpm_rate_entry_t) +
       2 * (uint64_t)cooldown_cap *
-          (cooldown_entry_size(pairs != NULL) + 2 * sizeof(uint32_t));
+          (cooldown_entry_size(store->ops->pairs) + 2 * sizeof(uint32_t));
   uint64_t total = sizeof(bishfpm_t) + workspace_bytes(c->max_event_items) +
                    2 * (uint64_t)group_cap * sizeof(bishfpm_group_t) +
                    per_group * c->max_groups;
-  return total > SIZE_MAX ? SIZE_MAX : (size_t)total;
+  size_t result, stores;
+  if (total > SIZE_MAX || !size_mul(store_bytes, c->max_groups, &stores) ||
+      !size_add((size_t)total, stores, &result))
+    return SIZE_MAX;
+  if (store->extension) {
+    store_extension_t *x = store->extension;
+    if (!size_add(result, sizeof(*x), &result) ||
+        !size_add(result, x->plan.engine_peak_bytes, &result))
+      return SIZE_MAX;
+  }
+  return result;
 }
 
 /* create engine instance */
-static bishfpm_t *create_options(const bishfpm_config_t *cfg,
-                                 const bishfpm_pair_options_t *pairs,
-                                 const bishfpm_options_t *options) {
+static bishfpm_t *create_internal(const bishfpm_config_t *cfg,
+                                  const bishfpm_pair_options_t *pairs,
+                                  const bishfpm_options_t *options,
+                                  store_extension_t *extension) {
   bishfpm_options_t o;
   bishfpm_options_default(&o);
   if (options)
@@ -317,13 +293,24 @@ static bishfpm_t *create_options(const bishfpm_config_t *cfg,
     return NULL;
   }
 
-  if (pairs && !validate_pairs(&c, pairs))
+  store_config_t selected = {0};
+  selected.ops = pairs ? &store_pair_ops : &store_text_ops;
+  if (extension)
+    selected.ops = extension->descriptor.representation == BISHFPM_STORE_PAIR64
+                       ? &store_extension_pair_ops
+                       : &store_extension_text_ops;
+  selected.extension = extension;
+  selected.mining = &c;
+  selected.sketch_width = o.sketch_width;
+  if (pairs)
+    selected.pairs = *pairs;
+  if (!selected.ops->validate(&selected))
     return NULL;
   size_t bound = o.memory_mode == BISHFPM_MEMORY_DYNAMIC
                      ? sizeof(bishfpm_t) +
                            INITIAL_GROUP_CAPACITY * sizeof(bishfpm_group_t) +
                            workspace_bytes(c.max_event_items)
-                     : memory_bound(&c, pairs, o.sketch_width);
+                     : memory_bound(&c, &selected);
   if (bound == SIZE_MAX || bound > c.max_memory_bytes)
     return NULL;
 
@@ -336,17 +323,35 @@ static bishfpm_t *create_options(const bishfpm_config_t *cfg,
   engine->options = o;
   engine->memory.limit = c.max_memory_bytes;
   engine->memory.current = engine->memory.peak = sizeof(*engine);
+  engine->numeric_pairs = selected.ops->pairs;
+  engine->store_config = selected;
+  engine->store_config.mining = &engine->cfg;
   bishfpm_memory_budget_t *budget = engine_budget(engine);
-  engine->numeric_pairs = pairs != NULL;
-  if (pairs)
-    engine->pair_options = *pairs;
   engine->busy = false; /* construction has not published the engine */
-  engine->stats.memory_bound_bytes = budget ? c.max_memory_bytes : bound;
+  engine->stats.memory_bound_bytes =
+      o.memory_mode == BISHFPM_MEMORY_DYNAMIC ? c.max_memory_bytes : bound;
+  if (extension) {
+    store_extension_t *owned = memory_calloc(budget, 1, sizeof(*owned));
+    if (!owned) {
+      memory_free(budget, engine, sizeof(*engine));
+      return NULL;
+    }
+    *owned = *extension;
+    engine->store_config.extension = owned;
+    if (!store_extension_init(owned, budget, &engine->cfg, extension->config,
+                              extension->bytes)) {
+      /* failed clones clean their own allocations */
+      memory_free(budget, owned, sizeof(*owned));
+      engine->store_config.extension = NULL;
+      memory_free(budget, engine, sizeof(*engine));
+      return NULL;
+    }
+  }
   engine->group_cap = INITIAL_GROUP_CAPACITY;
   engine->groups =
       memory_calloc(budget, engine->group_cap, sizeof(bishfpm_group_t));
   if (!engine->groups) {
-    memory_free(budget, engine, sizeof(*engine));
+    bishfpm_free(engine);
     return NULL;
   }
 
@@ -365,6 +370,41 @@ static bishfpm_t *create_options(const bishfpm_config_t *cfg,
   }
 
   return engine;
+}
+
+static bishfpm_t *create_options(const bishfpm_config_t *c,
+                                 const bishfpm_pair_options_t *p,
+                                 const bishfpm_options_t *o) {
+  return create_internal(c, p, o, NULL);
+}
+
+bishfpm_t *
+bishfpm_create_with_store(const bishfpm_config_t *cfg,
+                          const bishfpm_store_engine_options_t *options,
+                          const bishfpm_store_descriptor_t *descriptor,
+                          const void *settings, size_t size) {
+  bishfpm_config_t c;
+  if (cfg)
+    c = *cfg;
+  else
+    bishfpm_config_default(&c);
+  bishfpm_store_engine_options_t defaults;
+  bishfpm_store_engine_options_default(&defaults);
+  const bishfpm_store_engine_options_t *o = options ? options : &defaults;
+  if (o->abi_version != BISHFPM_STORE_ABI_V1 || o->struct_size < sizeof(*o))
+    return NULL;
+  c.topk_k = o->notification_capacity;
+  if (!validate_config(&c))
+    return NULL;
+  store_extension_t extension;
+  if (!store_extension_validate(descriptor, o, &c, settings, size, &extension))
+    return NULL;
+  /* raw settings live only through synchronous construction */
+  extension.config = (void *)settings;
+  extension.bytes = size;
+  bishfpm_options_t engine_options = {BISHFPM_STORE_SS, 0,
+                                      (bishfpm_memory_mode_t)o->memory_mode};
+  return create_internal(&c, NULL, &engine_options, &extension);
 }
 
 bishfpm_t *bishfpm_create_pairs(const bishfpm_config_t *cfg,
@@ -391,18 +431,13 @@ static void free_group_resources(bishfpm_group_t *grp) {
   if (!grp || !grp->group_key) {
     return;
   }
-  bool numeric = grp->pairs != NULL;
+  bool numeric = store_is_pairs(&grp->store);
   memory_free(grp->budget, grp->group_key, strlen(grp->group_key) + 1);
   if (grp->item_rates) {
     bishfpm_rate_table_free(grp->item_rates);
   }
-  if (grp->topk && !grp->topk->arena_backed) {
-    bishfpm_topk_free(grp->topk);
-  }
-  compact_free(grp->pairs);
-  if (grp->arena) {
-    bishfpm_arena_free(grp->arena);
-  }
+  if (grp->store.config)
+    grp->store.config->ops->destroy(&grp->store);
   if (grp->cooldowns) {
     memory_free(grp->budget, grp->cooldowns,
                 grp->cooldown_cap *
@@ -434,6 +469,12 @@ void bishfpm_free(bishfpm_t *engine) {
               engine->cfg.max_event_items * sizeof(size_t));
   memory_free(budget, engine->workspace.ids,
               engine->cfg.max_event_items * sizeof(uint32_t));
+  if (engine->store_config.extension) {
+    store_extension_t *x = engine->store_config.extension;
+    x->descriptor.destroy_config(&x->host, x->config);
+    assert(x->bytes == 0);
+    memory_free(budget, x, sizeof(*x));
+  }
   memory_free(budget, engine, sizeof(*engine));
 }
 
@@ -513,6 +554,7 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
   /* initialize new group */
   bishfpm_group_t *grp = &engine->groups[idx];
   grp->budget = engine_budget(engine);
+  grp->store.config = &engine->store_config;
   grp->group_key = memory_strdup(grp->budget, group_key);
   if (!grp->group_key) {
     return NULL;
@@ -520,20 +562,6 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
   grp->hash = h;
   bishfpm_rate_init(&grp->group_rate);
 
-  if (!engine->numeric_pairs) {
-    topk_layout_t layout;
-    if (!topk_layout_configured(engine->cfg.topk_k,
-                                engine->cfg.ewma_half_life_ms,
-                                engine->options.sketch_width, &layout)) {
-      free_group_resources(grp);
-      return NULL;
-    }
-    grp->arena = arena_new_budget(layout.arena_bytes, grp->budget);
-    if (!grp->arena) {
-      free_group_resources(grp);
-      return NULL;
-    }
-  }
   /* allocate item rate table */
   grp->item_rates = rate_table_new_budget(INITIAL_MARGINAL_CAPACITY,
                                           engine->cfg.max_items_per_group,
@@ -543,34 +571,14 @@ static bishfpm_group_t *get_or_create_group(bishfpm_t *engine,
     return NULL;
   }
 
-  if (engine->numeric_pairs) {
-    bishfpm_pair_options_t *o = &engine->pair_options;
-    grp->pairs = compact_new_budget(o->capacity, engine->cfg.ewma_half_life_ms,
-                                    o->sketch_width, o->store, o->forget_below,
-                                    grp->budget);
-    if (!grp->pairs) {
-      free_group_resources(grp);
-      return NULL;
-    }
-  } else {
-    /* allocate top-k using group arena */
-    grp->topk = engine->options.store == BISHFPM_STORE_FSS
-                    ? bishfpm_topk_new_fss_arena(grp->arena, engine->cfg.topk_k,
-                                                 engine->cfg.ewma_half_life_ms,
-                                                 engine->options.sketch_width,
-                                                 engine->cfg.hash_seed)
-                    : bishfpm_topk_new_arena(grp->arena, engine->cfg.topk_k,
-                                             engine->cfg.ewma_half_life_ms);
-    if (!grp->topk) {
-      free_group_resources(grp);
-      return NULL;
-    }
-    bishfpm_topk_set_seed(grp->topk, engine->cfg.hash_seed);
+  if (!engine->store_config.ops->create(&grp->store, grp->budget)) {
+    free_group_resources(grp);
+    return NULL;
   }
   grp->cooldown_cap = next_pow2(engine->cfg.topk_k * 2);
-  grp->cooldowns = memory_calloc(grp->budget, grp->cooldown_cap,
-                                 cooldown_entry_size(grp->pairs != NULL) +
-                                     2 * sizeof(uint32_t));
+  grp->cooldowns = memory_calloc(
+      grp->budget, grp->cooldown_cap,
+      cooldown_entry_size(store_is_pairs(&grp->store)) + 2 * sizeof(uint32_t));
   if (!grp->cooldowns) {
     free_group_resources(grp);
     return NULL;
@@ -604,7 +612,7 @@ static void cooldown_index_insert(void *table, size_t capacity, size_t stride,
  */
 static bishfpm_cooldown_entry_t *
 find_cooldown(bishfpm_group_t *grp, uint64_t hash, const void *identity) {
-  bool numeric = grp->pairs != NULL;
+  bool numeric = store_is_pairs(&grp->store);
   size_t stride = cooldown_entry_size(numeric);
   size_t mask = 2 * grp->cooldown_cap - 1;
   uint32_t *index = cooldown_index(grp->cooldowns, grp->cooldown_cap, stride);
@@ -623,7 +631,7 @@ find_cooldown(bishfpm_group_t *grp, uint64_t hash, const void *identity) {
 static size_t cooldown_maintain(bishfpm_group_t *grp, size_t capacity,
                                 uint64_t now_ms, uint64_t cooldown_ms,
                                 bool expire) {
-  size_t stride = cooldown_entry_size(grp->pairs != NULL);
+  size_t stride = cooldown_entry_size(store_is_pairs(&grp->store));
   uint64_t oldest = UINT64_MAX;
   uint64_t ref_time = effective_time(now_ms, grp->max_time_ms);
   size_t count = 0;
@@ -687,7 +695,7 @@ static bool check_and_update_cooldown(bishfpm_group_t *grp, uint64_t hash,
   if (now_ms > grp->max_time_ms)
     grp->max_time_ms = now_ms;
   uint64_t ref_time = grp->max_time_ms;
-  bool numeric = grp->pairs != NULL;
+  bool numeric = store_is_pairs(&grp->store);
   size_t stride = cooldown_entry_size(numeric);
   bishfpm_cooldown_entry_t *existing = find_cooldown(grp, hash, identity);
   if (existing) {
@@ -761,13 +769,27 @@ static bool is_pattern_subset(const char *sub_pattern,
 }
 
 /* check if candidate is subsumed by an active subset trigger */
+static inline double store_query_lower(const bishfpm_group_t *g,
+                                       const char *key, uint64_t now) {
+  if (g->store.config->extension) {
+    store_result_t r = g->store.config->ops->query_text(&g->store, key, now);
+    const store_extension_t *x = g->store.config->extension;
+    if (x->descriptor.capabilities & BISHFPM_STORE_ALERT_EVIDENCE)
+      return r.count.lower;
+    return x->descriptor.capabilities & BISHFPM_STORE_HEURISTIC_ESTIMATES
+               ? r.count.upper
+           : r.known ? r.count.lower
+                     : 0;
+  }
+  return bishfpm_topk_query_lower(g->store.state.text, key, now);
+}
 static bool is_candidate_subsumed(bishfpm_group_t *grp,
                                   const char *const *subset_items,
                                   size_t subset_len, double candidate_rate,
                                   uint64_t now_ms, uint64_t cooldown_ms,
                                   double subsumption_ratio, size_t min_order,
                                   uint64_t hash_seed) {
-  if (grp->pairs || subsumption_ratio <= 0.0 || !cooldown_ms ||
+  if (store_is_pairs(&grp->store) || subsumption_ratio <= 0.0 || !cooldown_ms ||
       !grp->cooldowns || !grp->cooldown_count || subset_len <= min_order) {
     return false;
   }
@@ -796,7 +818,7 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
       if (!entry || (now_ms >= entry->last_trigger_ms &&
                      now_ms - entry->last_trigger_ms >= cooldown_ms))
         continue;
-      double parent_rate = bishfpm_topk_query_lower(grp->topk, sub, now_ms);
+      double parent_rate = store_query_lower(grp, sub, now_ms);
       if (parent_rate > 0.0 && candidate_rate < subsumption_ratio * parent_rate)
         return true;
     }
@@ -810,8 +832,7 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
     }
     if (slot->entry.item_count < subset_len) {
       if (is_pattern_subset(slot->pattern, subset_items, subset_len)) {
-        double parent_rate =
-            bishfpm_topk_query_lower(grp->topk, slot->pattern, now_ms);
+        double parent_rate = store_query_lower(grp, slot->pattern, now_ms);
         if (parent_rate > 0.0 &&
             candidate_rate < subsumption_ratio * parent_rate) {
           return true; /* subsumed by active parent pattern */
@@ -875,6 +896,9 @@ typedef struct {
   bishfpm_trigger_cb cb;
   void *udata;
   int triggered_count;
+  bool require_resident;
+  bishfpm_store_count_t (*update_text)(void *, const char *, size_t, uint64_t,
+                                       double, uint64_t);
 } bishfpm_eval_ctx_t;
 
 static bool candidate_promoted(bishfpm_eval_ctx_t *ctx, size_t order,
@@ -882,7 +906,7 @@ static bool candidate_promoted(bishfpm_eval_ctx_t *ctx, size_t order,
   if (update.replaced)
     ctx->engine->stats.pattern_replacements++;
   ctx->engine->stats.candidates_evaluated++;
-  if (((ctx->grp->pairs || ctx->grp->topk->sketch_width) && !update.present) ||
+  if ((ctx->require_resident && !update.present) ||
       order < ctx->engine->cfg.min_itemset_order ||
       !(update.lower >= ctx->engine->cfg.min_pattern_rate))
     return false;
@@ -891,11 +915,11 @@ static bool candidate_promoted(bishfpm_eval_ctx_t *ctx, size_t order,
 }
 
 static void notify_candidate(bishfpm_eval_ctx_t *ctx,
-                             const char *const *subset_items, size_t subset_len,
+                             const char *const *subset_items,
+                             const size_t *item_lengths, size_t subset_len,
                              topk_result_t update, const char *pattern,
-                             uint64_t key, uint64_t hash,
+                             size_t pattern_len, uint64_t key, uint64_t hash,
                              const double *marginals) {
-  char numeric_pattern[BISHFPM_MAX_PATTERN_LEN];
   double p_rate = update.lower;
   double frac = ctx->group_rate > 0.0 ? (p_rate / ctx->group_rate) : 0.0;
 
@@ -919,7 +943,7 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
     return; /* subsumed by active parent pattern */
   }
 
-  /* Numeric callers pass the packed key and defer string serialization. */
+  /* numeric callers pass the packed key and defer string serialization */
   bool numeric = pattern == NULL;
   bool saturated = false;
   const void *identity = numeric ? (const void *)&key : (const void *)pattern;
@@ -932,12 +956,6 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
     return; /* cooldown active */
   }
 
-  if (numeric && ctx->cb) {
-    if (!bishfpm_itemset_serialize(subset_items, subset_len, numeric_pattern,
-                                   sizeof(numeric_pattern)))
-      return;
-    pattern = numeric_pattern;
-  }
   ctx->triggered_count++;
   ctx->engine->stats.triggers_emitted++;
 
@@ -946,9 +964,24 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
       lift =
           compute_subset_lift(subset_len, p_rate, ctx->group_rate, marginals);
     bishfpm_trigger_t trig;
-    memset(&trig, 0, sizeof(trig));
-    snprintf(trig.pattern, sizeof(trig.pattern), "%s", pattern);
-    bishfpm_itemset_format(pattern, trig.formatted, sizeof(trig.formatted));
+    if (numeric) {
+      size_t n0 = item_lengths[0], n1 = item_lengths[1];
+      memcpy(trig.pattern, subset_items[0], n0);
+      trig.pattern[n0] = BISHFPM_ITEM_DELIM;
+      memcpy(trig.pattern + n0 + 1, subset_items[1], n1 + 1);
+      if (n0 + 2 + n1 < sizeof(trig.formatted)) {
+        memcpy(trig.formatted, subset_items[0], n0);
+        trig.formatted[n0] = ',';
+        trig.formatted[n0 + 1] = ' ';
+        memcpy(trig.formatted + n0 + 2, subset_items[1], n1 + 1);
+      } else {
+        bishfpm_itemset_format(trig.pattern, trig.formatted,
+                               sizeof(trig.formatted));
+      }
+    } else {
+      memcpy(trig.pattern, pattern, pattern_len + 1);
+      bishfpm_itemset_format(pattern, trig.formatted, sizeof(trig.formatted));
+    }
     trig.pattern_rate = p_rate;
     trig.pattern_upper_bound = update.upper;
     trig.pattern_error = update.error;
@@ -963,48 +996,23 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
   }
 }
 
-/* Inputs and all possible subset lengths were validated by prepare_event.
- * Append each prefix once per order, preserving lexicographic enumeration. */
-static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
-                                  size_t target, size_t start, size_t depth,
-                                  const char **items, double *marginals,
-                                  char *pattern, size_t length) {
-  if (depth == target) {
-    pattern[length] = 0;
-    topk_result_t update = topk_add_sized(ctx->grp->topk, pattern, length,
-                                          ctx->weight, ctx->timestamp_ms);
-    bishfpm_pattern_pressure_t *p = &ctx->grp->pressure;
-    p->candidates_evaluated++;
-    if (ctx->weight == 0)
-      p->zero_weight_queries++;
-    else if (!update.accepted)
-      p->rejected_updates++;
-    else if (update.was_present)
-      p->resident_updates++;
-    else if (update.present)
-      p->admissions++;
-    else
-      p->filtered_updates++;
-    p->replacements += update.replaced;
-    if (candidate_promoted(ctx, depth, update))
-      notify_candidate(ctx, items, depth, update, pattern, 0, update.hash,
-                       marginals);
-    return;
-  }
-  size_t needed = target - depth;
-  for (size_t i = start; i + needed <= count; i++) {
-    size_t pos = length;
-    if (depth)
-      pattern[pos++] = BISHFPM_ITEM_DELIM;
-    const prepared_item_t *item = &ctx->event->items[i];
-    size_t item_length = item->length;
-    items[depth] = item->key;
-    marginals[depth] = item->marginal;
-    memcpy(pattern + pos, item->key, item_length);
-    evaluate_combinations(ctx, count, target, i + 1, depth + 1, items,
-                          marginals, pattern, pos + item_length);
-  }
+static topk_result_t extension_update_text(bishfpm_eval_ctx_t *ctx,
+                                           const char *key, size_t length) {
+  uint64_t hash = bishfpm_murmur3_64(key, length, ctx->engine->cfg.hash_seed);
+  return store_extension_update_count(
+      ctx->engine->store_config.extension,
+      ctx->update_text(ctx->grp->store.state.extension, key, length, hash,
+                       ctx->weight, ctx->timestamp_ms),
+      hash);
 }
+#define EVALUATE_COMBINATIONS evaluate_combinations
+#define UPDATE_TEXT(ctx, key, len)                                             \
+  topk_add_sized((ctx)->grp->store.state.text, (key), (len), (ctx)->weight,    \
+                 (ctx)->timestamp_ms)
+#include "evaluate_text.h"
+#define EVALUATE_COMBINATIONS evaluate_extension_combinations
+#define UPDATE_TEXT(ctx, key, len) extension_update_text((ctx), (key), (len))
+#include "evaluate_text.h"
 static int compare_lengths(const void *a, const void *b) {
   size_t x = *(const size_t *)a, y = *(const size_t *)b;
   return (x < y) - (x > y);
@@ -1059,6 +1067,8 @@ static int prepare_event(bishfpm_t *engine, const char *const *items,
     length = max_k - 1;
     for (size_t i = 0; i < max_k; i++)
       length += event->lengths[i];
+    for (size_t i = 0; i < event->count; i++)
+      event->lengths[i] = event->items[i].length;
   }
   if (length >= BISHFPM_MAX_PATTERN_LEN) {
     *reason = REJECT_PATTERN_LENGTH;
@@ -1130,7 +1140,7 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     budget_rejection = reason == REJECT_GROUPS;
     goto finalize;
   }
-  bool forget_before_commit = false;
+  store_reservation_t store_reservation = {0};
   size_t missing_marginals = 0;
   uint32_t next_id = (uint32_t)grp->item_rates->count;
   for (size_t i = 0; i < event->count; i++) {
@@ -1142,24 +1152,44 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     if (engine->numeric_pairs)
       event->ids[i] = entry ? entry->id : next_id++;
   }
-  if (engine->numeric_pairs) {
-    if (!compact_reserve(grp->pairs, event->ids, event->count,
-                         effective_time(timestamp_ms, grp->max_time_ms),
-                         &forget_before_commit)) {
+  uint64_t now = effective_time(timestamp_ms, grp->max_time_ms);
+  double effective_weight = 0;
+  int store_ready;
+  if (engine->store_config.extension) {
+    effective_weight = decay_since((double)weight, timestamp_ms, now,
+                                   engine->cfg.ewma_half_life_ms);
+    store_extension_t *x = engine->store_config.extension;
+    bishfpm_store_event_t view = {event->keys,
+                                  event->lengths,
+                                  engine->numeric_pairs ? event->ids : NULL,
+                                  event->count,
+                                  now,
+                                  effective_weight,
+                                  engine->cfg.min_itemset_order,
+                                  engine->cfg.max_itemset_order};
+    store_ready = x->descriptor.prepare_event(grp->store.state.extension, &view,
+                                              &store_reservation.token);
+  } else
+    store_ready = !engine->numeric_pairs ||
+                  store_prepare_pair(&grp->store, event->ids, event->count, now,
+                                     &store_reservation);
+  if (store_ready != 1) {
+    if (engine->numeric_pairs && !engine->store_config.extension)
       engine->pair_capacity_rejections++;
-      reason = REJECT_CANDIDATES;
-      budget_rejection = true;
-      if (engine->group_count != old_group_count) {
-        free_group_resources(grp);
-        engine->group_count--;
-      }
-      goto finalize;
+    reason = store_ready == 0 ? REJECT_CANDIDATES : REJECT_ALLOCATION;
+    budget_rejection = store_ready == 0;
+    if (engine->group_count != old_group_count) {
+      free_group_resources(grp);
+      engine->group_count--;
     }
+    goto finalize;
   }
   if (missing_marginals) {
     rate_prepare_result_t reservation =
         rate_table_prepare_result(grp->item_rates, event->keys, event->count);
     if (reservation != RATE_PREPARED) {
+      if (engine->store_config.extension)
+        store_cancel(&grp->store, &store_reservation);
       reason = reservation == RATE_LIMIT ? REJECT_MARGINALS : REJECT_ALLOCATION;
       if (engine->group_count != old_group_count) {
         free_group_resources(grp);
@@ -1174,14 +1204,14 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     }
   }
 
-  uint64_t now = effective_time(timestamp_ms, grp->max_time_ms);
-  double effective_weight = decay_since((double)weight, timestamp_ms, now,
-                                        engine->cfg.ewma_half_life_ms);
-  if (forget_before_commit) {
-    size_t forgotten =
-        compact_prune(grp->pairs, now, engine->pair_options.forget_below);
-    engine->pairs_forgotten += forgotten;
-  }
+  /* built-ins do not consume weight during pure capacity preflight; preserve
+   * the legacy rejection path's avoidance of unnecessary decay arithmetic */
+  if (!engine->store_config.extension)
+    effective_weight = decay_since((double)weight, timestamp_ms, now,
+                                   engine->cfg.ewma_half_life_ms);
+  if (store_reservation.prune || engine->store_config.extension)
+    engine->pairs_forgotten +=
+        store_commit(&grp->store, now, &store_reservation);
   grp->max_time_ms = now;
   engine->stats.events_accepted++;
   double group_rate = bishfpm_rate_update_weighted(
@@ -1208,37 +1238,59 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     size_t max_k = elevated < engine->cfg.max_itemset_order
                        ? elevated
                        : engine->cfg.max_itemset_order;
-    bishfpm_eval_ctx_t ctx = {engine,           grp, event, now, group_rate,
-                              effective_weight, cb,  udata, 0};
+    bishfpm_eval_ctx_t ctx = {
+        engine,
+        grp,
+        event,
+        now,
+        group_rate,
+        effective_weight,
+        cb,
+        udata,
+        0,
+        engine->numeric_pairs || engine->store_config.sketch_width ||
+            engine->store_config.extension,
+        engine->store_config.extension
+            ? ((store_extension_t *)engine->store_config.extension)
+                  ->descriptor.update_text
+            : NULL};
     /* Filtering preserves canonical order. Each update and its notification
      * finish before the next candidate; callbacks can query this exact state.
      */
     if (engine->numeric_pairs) {
-      for (size_t i = 0; i < elevated; i++)
-        for (size_t j = i + 1; j < elevated; j++) {
-          uint64_t key = compact_key(event->ids[i], event->ids[j]);
-          uint64_t hash = compact_hash(key);
-          topk_result_t update =
-              compact_add(grp->pairs, key, hash, effective_weight, now);
-          if (candidate_promoted(&ctx, 2, update)) {
-            const char *pair_items[] = {event->items[i].key,
-                                        event->items[j].key};
-            double marginals[] = {event->items[i].marginal,
-                                  event->items[j].marginal};
-            notify_candidate(&ctx, pair_items, 2, update, NULL, key, hash,
-                             marginals);
-          }
-        }
+      if (engine->store_config.extension) {
+        store_extension_t *x = engine->store_config.extension;
+        bishfpm_store_count_t (*update_pair)(void *, uint64_t, uint64_t, double,
+                                             uint64_t) =
+            x->descriptor.update_pair;
+        void *state = grp->store.state.extension;
+#define UPDATE_PAIR(key, hash)                                                 \
+  store_extension_update_count(                                                \
+      x, update_pair(state, (key), (hash), effective_weight, now), (hash))
+#include "evaluate_pair.h"
+      } else {
+#define UPDATE_PAIR(key, hash)                                                 \
+  compact_add(grp->store.state.pairs, (key), (hash), effective_weight, now)
+#include "evaluate_pair.h"
+      }
     } else {
       const char *sub_items[BISHFPM_MAX_ITEMSET_ORDER];
       double marginals[BISHFPM_MAX_ITEMSET_ORDER];
       char pattern[BISHFPM_MAX_PATTERN_LEN];
-      for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
-        evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, marginals,
-                              pattern, 0);
+      if (engine->store_config.extension) {
+        for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
+          evaluate_extension_combinations(&ctx, elevated, k, 0, 0, sub_items,
+                                          marginals, pattern, 0);
+      } else {
+        for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
+          evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, marginals,
+                                pattern, 0);
+      }
     }
     result = ctx.triggered_count;
   }
+  if (engine->store_config.extension)
+    store_finish(&grp->store, &store_reservation);
 finalize:
   if (result < 0) {
     if (engine_budget(engine) && engine->memory.denials != memory_denials) {
@@ -1312,64 +1364,70 @@ static bool lookup_pair(const bishfpm_t *engine, const bishfpm_group_t *group,
   *hash = compact_hash(*key);
   return true;
 }
-int bishfpm_pattern_bounds(bishfpm_t *engine, const char *name,
-                           const char *pattern, uint64_t now,
-                           bishfpm_count_bounds_t *out) {
-  if (!engine || !name || !pattern || !out || !pattern[0] ||
+static bool query_pattern(const bishfpm_t *engine, const char *name,
+                          const char *pattern, uint64_t now,
+                          store_result_t *out) {
+  if (!engine || !name || !pattern || !pattern[0] ||
       strnlen(pattern, BISHFPM_MAX_PATTERN_LEN) >= BISHFPM_MAX_PATTERN_LEN)
-    return 0;
-  bishfpm_group_t *g = find_group(engine, name, NULL);
-  *out = (bishfpm_count_bounds_t){0, 0, 0, 1};
+    return false;
+  const bishfpm_group_t *g = find_group(engine, name, NULL);
   if (!g) {
     uint64_t key, hash;
+    *out = (store_result_t){{0}, true};
     return !engine->numeric_pairs ||
            lookup_pair(engine, NULL, pattern, &key, &hash);
   }
   now = effective_time(now, g->max_time_ms);
-  topk_result_t r;
-  if (g->pairs) {
+  if (engine->numeric_pairs) {
     uint64_t key, hash;
     if (!lookup_pair(engine, g, pattern, &key, &hash))
-      return 0;
-    r = compact_query(g->pairs, key, hash, now);
+      return false;
+    *out = g->store.config->ops->query_pair(&g->store, key, hash, now);
   } else
-    r = topk_query_result(g->topk, pattern, now);
-  out->lower = r.lower;
-  out->upper = r.upper;
-  out->resident = r.present;
-  out->known = r.present ||
-               (g->pairs && (g->pairs->kind == BISHFPM_PAIR_THRESHOLD ||
-                             g->pairs->kind == BISHFPM_PAIR_FSS)) ||
-               (g->topk && g->topk->sketch_width != 0);
+    *out = g->store.config->ops->query_text(&g->store, pattern, now);
+  return true;
+}
+
+int bishfpm_pattern_bounds(bishfpm_t *engine, const char *name,
+                           const char *pattern, uint64_t now,
+                           bishfpm_count_bounds_t *out) {
+  store_result_t r;
+  if (!out || !query_pattern(engine, name, pattern, now, &r))
+    return 0;
+  bool heuristic = engine->store_config.extension &&
+                   (((store_extension_t *)engine->store_config.extension)
+                        ->descriptor.capabilities &
+                    BISHFPM_STORE_HEURISTIC_ESTIMATES);
+  *out =
+      (bishfpm_count_bounds_t){heuristic && !r.known ? 0 : r.count.lower,
+                               heuristic && !r.known ? INFINITY : r.count.upper,
+                               r.count.present, r.known};
   return 1;
 }
+
 void bishfpm_get_pair_stats(const bishfpm_t *engine,
                             bishfpm_pair_stats_t *out) {
   if (!engine || !out)
     return;
+  if (!engine->numeric_pairs || engine->store_config.extension) {
+    *out = (bishfpm_pair_stats_t){0};
+    return;
+  }
   *out = (bishfpm_pair_stats_t){engine->pair_capacity_rejections,
                                 engine->pairs_forgotten, 0, 0};
   for (size_t i = 0; i < engine->group_cap; i++)
-    if (engine->groups[i].group_key && engine->groups[i].pairs) {
-      compact_t *p = engine->groups[i].pairs;
-      out->resident_pairs += p->heap_size;
-      out->store_bytes += compact_bytes(p->k, p->sketch_width, p->kind);
+    if (engine->groups[i].group_key) {
+      store_t const *s = &engine->groups[i].store;
+      store_snapshot_t snap = s->config->ops->snapshot(s);
+      out->resident_pairs += snap.residents;
+      out->store_bytes += snap.bytes;
     }
 }
 
 double bishfpm_pattern_rate(bishfpm_t *engine, const char *key,
                             const char *pattern, uint64_t now_ms) {
-  bishfpm_group_t *grp = find_group(engine, key, NULL);
-  if (grp && grp->pairs) {
-    bishfpm_count_bounds_t bounds;
-    return bishfpm_pattern_bounds(engine, key, pattern, now_ms, &bounds)
-               ? bounds.upper
-               : 0;
-  }
-  return grp && pattern
-             ? bishfpm_topk_query(grp->topk, pattern,
-                                  effective_time(now_ms, grp->max_time_ms))
-             : 0;
+  store_result_t r;
+  return query_pattern(engine, key, pattern, now_ms, &r) ? r.count.upper : 0;
 }
 
 /* Retain numeric identities, but preserve legacy marginal forgetting/gating.
@@ -1397,7 +1455,10 @@ static size_t prune_numeric_marginals(bishfpm_rate_table_t *table, uint64_t now,
 size_t bishfpm_prune_pairs(bishfpm_t *engine, const char *group_key,
                            uint64_t now_ms, size_t max_pairs) {
   if (!engine || !group_key || !max_pairs || engine->busy ||
-      !engine->numeric_pairs)
+      !engine->numeric_pairs || !engine->store_config.ops->prune_bounded ||
+      (engine->store_config.extension &&
+       !((store_extension_t *)engine->store_config.extension)
+            ->descriptor.prune_bounded))
     return 0;
   bishfpm_group_t *group = find_group(engine, group_key, NULL);
   if (!group)
@@ -1408,7 +1469,8 @@ size_t bishfpm_prune_pairs(bishfpm_t *engine, const char *group_key,
                                               engine->cfg.ewma_half_life_ms);
   group->group_rate.last_time_ms = now;
   group->max_time_ms = now;
-  size_t forgotten = compact_prune_bounded(group->pairs, now, max_pairs);
+  size_t forgotten =
+      group->store.config->ops->prune_bounded(&group->store, now, max_pairs);
   engine->pairs_forgotten += forgotten;
   engine->busy = false;
   return forgotten;
@@ -1428,12 +1490,10 @@ static void prune_group(bishfpm_t *engine, bishfpm_group_t *group,
           : bishfpm_rate_table_prune(group->item_rates, effective,
                                      engine->cfg.ewma_half_life_ms, min_rate);
   engine->stats.items_pruned += ip;
-  if (group->pairs) {
-    engine->pairs_forgotten += compact_prune(group->pairs, effective, min_rate);
-  }
-  if (group->topk) {
-    bishfpm_topk_prune(group->topk, effective, min_rate);
-  }
+  size_t forgotten =
+      group->store.config->ops->prune(&group->store, effective, min_rate);
+  if (engine->numeric_pairs)
+    engine->pairs_forgotten += forgotten;
   if (group->cooldown_count && effective >= group->cooldown_oldest_ms &&
       effective - group->cooldown_oldest_ms >= engine->cfg.trigger_cooldown_ms)
     cooldown_maintain(group, group->cooldown_cap, effective,
@@ -1579,7 +1639,8 @@ size_t bishfpm_prune(bishfpm_t *engine, uint64_t now_ms, double min_rate) {
 
 int bishfpm_get_pattern_pressure(const bishfpm_t *engine, const char *name,
                                  bishfpm_pattern_pressure_t *out) {
-  if (!engine || !out || engine->numeric_pairs)
+  if (!engine || !out || engine->numeric_pairs ||
+      engine->store_config.extension)
     return 0;
   bishfpm_pattern_pressure_t result = engine->pressure;
   result.resident_patterns = result.resident_capacity = 0;
@@ -1588,14 +1649,17 @@ int bishfpm_get_pattern_pressure(const bishfpm_t *engine, const char *name,
     if (!group)
       return 0;
     result = group->pressure;
-    result.resident_patterns = bishfpm_topk_count(group->topk);
+    result.resident_patterns =
+        group->store.config->ops->snapshot(&group->store).residents;
     result.resident_capacity = engine->cfg.topk_k;
   } else {
     for (size_t i = 0; i < engine->group_cap; i++) {
       if (!engine->groups[i].group_key)
         continue;
       pressure_add(&result, &engine->groups[i].pressure);
-      result.resident_patterns += bishfpm_topk_count(engine->groups[i].topk);
+      result.resident_patterns +=
+          engine->store_config.ops->snapshot(&engine->groups[i].store)
+              .residents;
       result.resident_capacity += engine->cfg.topk_k;
     }
   }
@@ -1646,6 +1710,10 @@ void bishfpm_get_stats(const bishfpm_t *engine, bishfpm_stats_t *out) {
   out->memory_current_bytes = sizeof(*engine) +
                               engine->group_cap * sizeof(*engine->groups) +
                               workspace_bytes(engine->cfg.max_event_items);
+  if (engine->store_config.extension) {
+    const store_extension_t *x = engine->store_config.extension;
+    out->memory_current_bytes += sizeof(*x) + x->bytes;
+  }
   for (size_t i = 0; i < engine->group_cap; i++) {
     const bishfpm_group_t *g = &engine->groups[i];
     if (!g->group_key)
@@ -1653,15 +1721,10 @@ void bishfpm_get_stats(const bishfpm_t *engine, bishfpm_stats_t *out) {
     out->memory_current_bytes +=
         strlen(g->group_key) + 1 + sizeof(*g->item_rates) +
         g->item_rates->capacity * sizeof(*g->item_rates->entries) +
-        (g->arena ? sizeof(*g->arena) + (size_t)(g->arena->end - g->arena->base)
-                  : 0) +
         g->cooldown_cap *
-            (cooldown_entry_size(g->pairs != NULL) + 2 * sizeof(uint32_t));
-    if (g->pairs)
-      out->memory_current_bytes +=
-          compact_bytes(g->pairs->k, g->pairs->sketch_width, g->pairs->kind);
-    if (g->topk && !g->topk->arena_backed)
-      out->memory_current_bytes += bishfpm_topk_storage_bytes(g->topk);
+            (cooldown_entry_size(engine->numeric_pairs) + 2 * sizeof(uint32_t));
+    out->memory_current_bytes +=
+        g->store.config->ops->snapshot(&g->store).bytes;
     out->memory_current_bytes += g->item_rates->key_bytes;
   }
 }
@@ -1682,3 +1745,29 @@ void bishfpm_get_rejection_stats(const bishfpm_t *engine,
 
 /* query library version */
 const char *bishfpm_version(void) { return BISHFPM_VERSION_STRING; }
+
+int bishfpm_get_store_description(const bishfpm_t *e,
+                                  bishfpm_store_description_t *out) {
+  if (!e || !out || out->abi_version != BISHFPM_STORE_ABI_V1 ||
+      out->struct_size < sizeof(*out) || !e->store_config.extension)
+    return 0;
+  const store_extension_t *x = e->store_config.extension;
+  uint32_t size = out->struct_size;
+  *out = (bishfpm_store_description_t){BISHFPM_STORE_ABI_V1,         size,
+                                       x->descriptor.representation, 0,
+                                       x->descriptor.capabilities,   x->plan};
+  return 1;
+}
+int bishfpm_get_store_snapshot(const bishfpm_t *e, const char *name,
+                               uint32_t size, bishfpm_store_snapshot_t *out) {
+  if (!e || !name || !out || size < sizeof(*out) || !e->store_config.extension)
+    return 0;
+  const bishfpm_group_t *g = find_group(e, name, NULL);
+  if (!g)
+    return 0;
+  const store_extension_t *x = e->store_config.extension;
+  bishfpm_store_snapshot_t result = {0};
+  x->descriptor.snapshot(g->store.state.extension, &result);
+  *out = result;
+  return 1;
+}

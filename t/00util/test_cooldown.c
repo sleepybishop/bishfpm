@@ -21,8 +21,9 @@ static void *tracked_calloc(size_t n, size_t size, const char *function) {
 
 static bishfpm_group_t group(size_t capacity) {
   bishfpm_group_t g = {0};
-  static compact_t numeric_store;
-  g.pairs = numeric_mode ? &numeric_store : NULL;
+  static const store_config_t text_config = {.ops = &store_text_ops};
+  static const store_config_t pair_config = {.ops = &store_pair_ops};
+  g.store.config = numeric_mode ? &pair_config : &text_config;
   g.cooldown_cap = capacity;
   g.cooldowns = calloc(capacity, cooldown_entry_size(numeric_mode != 0) +
                                      2 * sizeof(uint32_t));
@@ -207,19 +208,20 @@ static void subsumption_probe_equivalence(void) {
   for (unsigned seeded = 0; seeded < 2; seeded++) {
     uint64_t seed = seeded ? UINT64_C(0xfedcba9876543210) : 0;
     bishfpm_group_t g = group(16);
-    g.topk = bishfpm_topk_new(16, 1000);
-    assert(g.topk);
-    bishfpm_topk_set_seed(g.topk, seed);
+    g.store.state.text = bishfpm_topk_new(16, 1000);
+    assert(g.store.state.text);
+    bishfpm_topk_set_seed(g.store.state.text, seed);
     bool saturated = false;
     for (size_t i = 0; i < sizeof(patterns) / sizeof(*patterns); i++) {
-      assert(bishfpm_topk_add(g.topk, patterns[i], 10 + i, 1000) > 0);
+      assert(bishfpm_topk_add(g.store.state.text, patterns[i], 10 + i, 1000) >
+             0);
       assert(!check_and_update_cooldown(&g, bishfpm_hash_str(patterns[i], seed),
                                         patterns[i], 2, 1000 + i * 10, 100,
                                         &saturated));
     }
     for (unsigned pruned = 0; pruned < 2; pruned++) {
       if (pruned)
-        assert(bishfpm_topk_prune(g.topk, 1000, 12) == 2);
+        assert(bishfpm_topk_prune(g.store.state.text, 1000, 12) == 2);
       for (uint64_t now = 990; now <= 1140; now += 10) {
         for (size_t candidate = 0; candidate < 4; candidate++) {
           for (unsigned rate = 0; rate < 20; rate++) {
@@ -232,7 +234,7 @@ static void subsumption_probe_equivalence(void) {
         }
       }
     }
-    bishfpm_topk_free(g.topk);
+    bishfpm_topk_free(g.store.state.text);
     release(&g);
   }
 }
