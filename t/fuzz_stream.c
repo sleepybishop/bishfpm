@@ -1,4 +1,5 @@
 #include "bishfpm.h"
+#include "examples/exact_store.h"
 #include <assert.h>
 #include <math.h>
 #include <stddef.h>
@@ -15,7 +16,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (!size)
     return 0;
   unsigned selector = *data++;
-  unsigned store = selector % 5;
+  unsigned store = selector % 7;
   size--;
   bishfpm_config_t c;
   bishfpm_config_default(&c);
@@ -36,7 +37,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     c.max_memory_bytes = 64U << 10;
   }
   bishfpm_t *e;
-  if (store >= 2) {
+  if (store >= 5) {
+    if (store == 6)
+      c.min_itemset_order = c.max_itemset_order = 2;
+    exact_store_options_t backend = {
+        16, store == 5 ? BISHFPM_STORE_TEXT : BISHFPM_STORE_PAIR64, "fuzz"};
+    bishfpm_store_engine_options_t options;
+    bishfpm_store_engine_options_default(&options);
+    options.memory_mode = engine_options.memory_mode;
+    options.notification_capacity = c.topk_k;
+    e = bishfpm_create_with_store(
+        &c, &options, store == 5 ? &exact_text_store : &exact_pair_store,
+        &backend, sizeof(backend));
+  } else if (store >= 2) {
     c.min_itemset_order = c.max_itemset_order = 2;
     bishfpm_pair_options_t options = {store == 2   ? BISHFPM_PAIR_SS
                                       : store == 3 ? BISHFPM_PAIR_THRESHOLD
@@ -95,9 +108,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     bishfpm_rejection_stats_t reasons;
     bishfpm_get_rejection_stats(e, &reasons);
     assert(reasons.invalid_input + reasons.event_items_limit +
-           reasons.pattern_length_limit + reasons.candidate_limit +
-           reasons.group_limit + reasons.marginal_limit +
-           reasons.allocation_failure + reasons.reentrant == st.events_rejected);
+               reasons.pattern_length_limit + reasons.candidate_limit +
+               reasons.group_limit + reasons.marginal_limit +
+               reasons.allocation_failure + reasons.reentrant ==
+           st.events_rejected);
   }
   bishfpm_free(e);
   return 0;

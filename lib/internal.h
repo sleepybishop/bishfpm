@@ -111,7 +111,8 @@ typedef struct {
   size_t slot_cap, heap_bytes, map_bytes, sketch_bytes, arena_bytes;
 } topk_layout_t;
 
-/* Include worst-case alignment padding for the store, arrays, and optional sketch. */
+/* Include worst-case alignment padding for the store, arrays, and optional
+ * sketch. */
 static inline bool topk_layout_configured(uint32_t k, double half_life_ms,
                                           uint32_t width,
                                           topk_layout_t *layout) {

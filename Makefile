@@ -14,6 +14,8 @@ CORE_OBJ = \
 	lib/topk.o \
 	lib/pairs.o \
 	lib/compact.o \
+	lib/store.o \
+	lib/store_plugin.o \
 	lib/bishfpm.o
 
 TEST_UTILS = \
@@ -35,16 +37,19 @@ TEST_UTILS = \
 	t/00util/test_rejections \
 	t/00util/test_general_fss \
 	t/00util/test_dynamic \
-	t/00util/test_pressure
+	t/00util/test_pressure \
+	t/00util/test_store_plugin
 
 BENCH = \
 	t/00util/bench \
 	t/00util/bench_stores \
 	t/00util/bench_cooldown \
-	t/00util/bench_general
+	t/00util/bench_general \
+	t/00util/bench_engines
 
 EXAMPLES = \
-	examples/stream_tsv
+	examples/stream_tsv \
+	examples/store_plugin
 
 all: libraries $(TEST_UTILS) $(BENCH) $(EXAMPLES)
 
@@ -70,6 +75,15 @@ t/00util/test_dynamic: t/00util/test_dynamic.c libbishfpm.a
 t/00util/test_pressure: t/00util/test_pressure.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=calloc $(LDLIBS) -UNDEBUG -o $@
 
+t/00util/bench_engines: t/00util/bench_engines.c t/00util/store_twins.c t/00util/store_twins.h libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< t/00util/store_twins.c libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
+
+t/00util/test_store_plugin: t/00util/test_store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
+examples/store_plugin: examples/store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) $(LDLIBS) -o $@
+
 t/00util/%: t/00util/%.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) $(LDLIBS) -UNDEBUG -o $@
 
@@ -81,7 +95,7 @@ examples/%: examples/%.c libbishfpm.a
 -include $(patsubst %,%.d,$(BENCH))
 -include $(patsubst %,%.d,$(EXAMPLES))
 
-test: $(TEST_UTILS) $(EXAMPLES) t/00util/bench_general
+test: $(TEST_UTILS) $(EXAMPLES) t/00util/bench_general t/00util/bench_engines
 	prove -I. -v t/*.t
 
 check: test
@@ -99,7 +113,7 @@ valgrind: $(TEST_UTILS) $(EXAMPLES)
 	done
 
 indent:
-	clang-format -style=LLVM -i include/*.h lib/*.c t/00util/*.c examples/*.c
+	clang-format -style=LLVM -i include/*.h lib/*.c lib/*.h t/00util/*.c t/00util/*.h examples/*.c examples/*.h t/fuzz_stream.c
 
 clean:
 	$(RM) lib/*.o lib/*.d t/00util/*.o t/00util/*.d examples/*.o examples/*.d *.o *.a *.d libbishfpm.so* bishfpm.pc $(TEST_UTILS) $(BENCH) $(EXAMPLES)
@@ -142,9 +156,9 @@ sanitize:
 	$(MAKE) clean
 	$(MAKE) CC=clang CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined,float-cast-overflow -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined,float-cast-overflow' check
 
-build/fuzz_stream: t/fuzz_stream.c $(wildcard lib/*.c) $(wildcard include/*.h) $(wildcard lib/*.h)
+build/fuzz_stream: examples/exact_store.c examples/exact_store.h t/fuzz_stream.c $(wildcard lib/*.c) $(wildcard include/*.h) $(wildcard lib/*.h)
 	mkdir -p build
-	clang $(CPPFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined,float-cast-overflow -fno-omit-frame-pointer t/fuzz_stream.c lib/*.c -lm -UNDEBUG -o $@
+	clang $(CPPFLAGS) -O1 -g -fsanitize=fuzzer,address,undefined,float-cast-overflow -fno-omit-frame-pointer t/fuzz_stream.c examples/exact_store.c lib/*.c -lm -UNDEBUG -o $@
 
 fuzz-smoke: build/fuzz_stream
 	mkdir -p build/corpus

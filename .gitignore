@@ -11,8 +11,10 @@ callgrind.*
 perf.data*
 build/
 examples/stream_tsv
+examples/store_plugin
 t/00util/*
 !t/00util/*.c
+!t/00util/*.h
 
 libbishfpm.so.*
 bishfpm.pc
