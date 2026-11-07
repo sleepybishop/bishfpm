@@ -1,44 +1,8 @@
-#include "bishfpm_hash.h"
+#define NO_MALLOC_WRAP
 #include "bishfpm_itemset.h"
 #include "bishfpm_uss.h"
-#include <assert.h>
-#include <float.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-typedef struct {
-  size_t bytes, peak;
-  long fail, calls;
-} ledger_t;
-static void *allocate(void *raw, size_t n) {
-  ledger_t *l = raw;
-  if (l->fail >= 0 && l->calls++ == l->fail)
-    return NULL;
-  void *p = malloc(n);
-  if (p) {
-    l->bytes += n;
-    if (l->bytes > l->peak)
-      l->peak = l->bytes;
-  }
-  return p;
-}
-static void *zeroed(void *raw, size_t n, size_t size) {
-  if (size && n > SIZE_MAX / size)
-    return NULL;
-  void *p = allocate(raw, n * size);
-  if (p)
-    memset(p, 0, n * size);
-  return p;
-}
-static void release(void *raw, void *p, size_t n) {
-  ledger_t *l = raw;
-  if (p) {
-    assert(l->bytes >= n);
-    l->bytes -= n;
-    free(p);
-  }
-}
+#include "plugin_test.h"
+
 static const bishfpm_store_descriptor_t *pair = &bishfpm_uss_pair_store,
                                         *text = &bishfpm_uss_store;
 static void same(bishfpm_store_count_t a, bishfpm_store_count_t b) {
@@ -106,7 +70,7 @@ static void boundaries(void) {
   bishfpm_uss_options_t o = {97, 42};
   bishfpm_store_plan_t p;
   assert(pair->plan(&c, &o, sizeof(o), &p));
-  /* 32-byte rows plus 256 32-bit slots and the fixed store header. */
+  /* 32-byte rows plus 256 32-bit slots and the fixed store header */
   bishfpm_uss_options_t o2 = {98, 42};
   bishfpm_store_plan_t p2;
   assert(pair->plan(&c, &o2, sizeof(o2), &p2));
@@ -180,28 +144,19 @@ static void alert(const char *g, const bishfpm_trigger_t *t, void *raw) {
   assert(!strcmp(expected, t->formatted));
 }
 static void engines(void) {
-  for (unsigned dynamic = 0; dynamic < 2; dynamic++) {
-    bishfpm_config_t c;
-    bishfpm_config_default(&c);
-    c.min_itemset_order = c.max_itemset_order = 2;
-    c.item_rate_threshold = c.item_share_threshold = c.min_lift =
-        c.promotion_fraction = 0;
-    c.min_pattern_rate = 1;
-    c.trigger_cooldown_ms = 0;
+  for (int dynamic = 0; dynamic < 2; dynamic++) {
+    bishfpm_config_t c = mining();
+    c.max_itemset_order = 2;
+    c.min_lift = 0;
     c.max_groups = 1;
     c.max_items_per_group = 64;
-    c.max_event_items = 8;
     bishfpm_uss_options_t cfg = {64, 42};
-    bishfpm_store_engine_options_t o;
-    bishfpm_store_engine_options_default(&o);
-    o.memory_mode =
-        dynamic ? BISHFPM_MEMORY_DYNAMIC : BISHFPM_MEMORY_CONSERVATIVE;
-    bishfpm_t *e = bishfpm_create_with_store(&c, &o, pair, &cfg, sizeof(cfg));
+    bishfpm_t *e = create_with_options(pair, &c, &cfg, sizeof(cfg), dynamic);
     assert(e);
-    const char *items[] = {"c", "a", "b"};
-    unsigned calls = 0;
-    assert(bishfpm_add_event(e, "g", 0, items, 3, alert, &calls) == 3 &&
-           calls == 3);
+    const char *unordered[] = {"c", "a", "b"};
+    unsigned count = 0;
+    assert(bishfpm_add_event(e, "g", 0, unordered, 3, alert, &count) == 3 &&
+           count == 3);
     bishfpm_count_bounds_t b;
     assert(bishfpm_pattern_bounds(e, "g", "a\037b", 0, &b));
     assert(!b.known && b.resident && b.lower == 0 && isinf(b.upper));
@@ -218,7 +173,7 @@ static void engines(void) {
     bishfpm_get_memory_stats(e, &m);
     assert(m.current_bytes <= m.limit_bytes);
     assert(bishfpm_prune(e, UINT64_MAX, 1) == 1);
-    assert(bishfpm_add_event(e, "g", 0, items, 3, alert, &calls) == 3);
+    assert(bishfpm_add_event(e, "g", 0, unordered, 3, alert, &count) == 3);
     bishfpm_free(e);
   }
 }

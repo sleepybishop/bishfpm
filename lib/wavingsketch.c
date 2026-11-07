@@ -1,12 +1,7 @@
 /* weighted EWMA adaptation of WavingSketch (Li et al., KDD 2020) using only
  * installed public interfaces */
-#include "bishfpm_hash.h"
-#include "bishfpm_rate.h"
 #include "bishfpm_wavingsketch.h"
-#include <float.h>
-#include <math.h>
-#include <stdbool.h>
-#include <string.h>
+#include "plugin_common.h"
 
 typedef struct {
   uint64_t hash;
@@ -35,19 +30,6 @@ typedef struct {
   uint64_t max_time;
   double total;
 } wave_store_t;
-static uint64_t effective_time(uint64_t a, uint64_t b) { return a > b ? a : b; }
-static bool checked_add(size_t a, size_t b, size_t *out) {
-  if (b > SIZE_MAX - a)
-    return false;
-  *out = a + b;
-  return true;
-}
-static bool checked_mul(size_t a, size_t b, size_t *out) {
-  if (a && b > SIZE_MAX / a)
-    return false;
-  *out = a * b;
-  return true;
-}
 void bishfpm_wavingsketch_options_default(bishfpm_wavingsketch_options_t *o) {
   if (o)
     *o = (bishfpm_wavingsketch_options_t){16, 4};
@@ -73,31 +55,7 @@ static bool configure(const bishfpm_config_t *m, const void *raw, size_t n,
          checked_add(sizeof(wave_store_t), c->cell_bytes, &total) &&
          checked_add(total, c->bucket_bytes, &c->group_bytes);
 }
-static int plan(const bishfpm_config_t *m, const void *raw, size_t n,
-                bishfpm_store_plan_t *out) {
-  wave_config_t c;
-  if (!out || !configure(m, raw, n, &c))
-    return 0;
-  *out = (bishfpm_store_plan_t){
-      sizeof(c), c.group_bytes, 1, BISHFPM_MAX_ITEMSET_ORDER, {0, 0}};
-  return 1;
-}
-static int clone_config(const bishfpm_store_host_t *h,
-                        const bishfpm_config_t *m, const void *raw, size_t n,
-                        void **out) {
-  wave_config_t c;
-  if (!h || !out || !configure(m, raw, n, &c))
-    return 0;
-  wave_config_t *p = h->allocate(h->context, sizeof(*p));
-  if (!p)
-    return 0;
-  *p = c;
-  *out = p;
-  return 1;
-}
-static void destroy_config(const bishfpm_store_host_t *h, void *raw) {
-  h->release(h->context, raw, sizeof(wave_config_t));
-}
+BISHFPM_PLUGIN_CONFIG_OPS(wave_config_t, 1, BISHFPM_MAX_ITEMSET_ORDER)
 static void destroy(const bishfpm_store_host_t *h, void *raw) {
   wave_store_t *s = raw;
   h->release(h->context, s->cells, s->config->cell_bytes);
@@ -118,17 +76,6 @@ static int create(const bishfpm_store_host_t *h, const void *raw, void **out) {
   }
   *out = s;
   return 1;
-}
-static int prepare(void *raw, const bishfpm_store_event_t *event,
-                   void **token) {
-  (void)raw;
-  (void)event;
-  *token = NULL;
-  return 1;
-}
-static void complete(void *raw, void *token) {
-  (void)raw;
-  (void)token;
 }
 /* independent seeded hash domains for bucket placement and wave sign; caller
  * hash is an identity prefilter and full keys resolve aliases */
@@ -154,10 +101,8 @@ static double decayed(const wave_store_t *s, double value, uint64_t dt) {
 }
 static double evidence_at(const wave_store_t *s, const wave_cell_t *cell,
                           uint64_t now) {
-  uint64_t then = cell->evidence_time;
-  return now <= then ? cell->evidence
-                     : bishfpm_rate_decay(cell->evidence, now - then,
-                                          s->config->half_life);
+  return decay_since(cell->evidence, cell->evidence_time, now,
+                     s->config->half_life);
 }
 static bishfpm_store_count_t query_text(const void *raw, const char *key,
                                         size_t length, uint64_t hash,

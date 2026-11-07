@@ -1,77 +1,7 @@
-#include "bishfpm_hash.h"
-#include "bishfpm_rate.h"
 #include "bishfpm_wavingsketch.h"
-#include <assert.h>
-#include <float.h>
-#include <math.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "plugin_test.h"
 
-void *__real_malloc(size_t);
-void *__real_calloc(size_t, size_t);
-char *__real_strdup(const char *);
-static long fail_at = -1, calls;
-static int deny(void) { return fail_at >= 0 && calls++ == fail_at; }
-void *__wrap_malloc(size_t n) { return deny() ? NULL : __real_malloc(n); }
-void *__wrap_calloc(size_t n, size_t s) {
-  return deny() ? NULL : __real_calloc(n, s);
-}
-char *__wrap_strdup(const char *s) { return deny() ? NULL : __real_strdup(s); }
-
-typedef struct {
-  size_t bytes, peak;
-  long fail, allocs;
-} ledger_t;
-static void *allocate(void *ctx, size_t n) {
-  ledger_t *l = ctx;
-  if (l->fail >= 0 && l->allocs++ == l->fail)
-    return NULL;
-  void *p = malloc(n);
-  if (p) {
-    l->bytes += n;
-    if (l->bytes > l->peak)
-      l->peak = l->bytes;
-  }
-  return p;
-}
-static void *zeroed(void *ctx, size_t n, size_t size) {
-  assert(!n || size <= SIZE_MAX / n);
-  void *p = allocate(ctx, n * size);
-  if (p)
-    memset(p, 0, n * size);
-  return p;
-}
-static void release(void *ctx, void *p, size_t n) {
-  ledger_t *l = ctx;
-  if (p) {
-    assert(l->bytes >= n);
-    l->bytes -= n;
-    free(p);
-  }
-}
-static bishfpm_config_t mining(void) {
-  bishfpm_config_t c;
-  bishfpm_config_default(&c);
-  c.min_itemset_order = 2;
-  c.max_itemset_order = 3;
-  c.item_rate_threshold = c.item_share_threshold = c.promotion_fraction = 0;
-  c.min_pattern_rate = 1;
-  c.trigger_cooldown_ms = 0;
-  c.ewma_half_life_ms = 1000;
-  c.max_groups = 2;
-  c.max_items_per_group = 8;
-  c.max_event_items = 8;
-  c.hash_seed = 42;
-  return c;
-}
 static const bishfpm_store_descriptor_t *d = &bishfpm_wavingsketch_store;
-static const char *items[] = {"a", "b", "c"};
-static void close_to(double x, double y) {
-  assert(fabs(x - y) <= 1e-10 * fmax(1, fabs(y)));
-}
-
 static void primitives(void) {
   bishfpm_config_t c = mining();
   bishfpm_wavingsketch_options_t o = {7, 4};
@@ -132,8 +62,7 @@ static void primitives(void) {
   assert(d->update_text(state, "a", 1, 0, DBL_MAX, 1000).outcome ==
          BISHFPM_UPDATE_REJECTED);
   assert(d->query_text(state, "a", 1, 0, 0).upper == DBL_MAX);
-  /* A large value can survive even when a stand-alone decay factor underflows.
-   */
+  /* a large value can survive even when a standalone decay factor underflows */
   close_to(d->query_text(state, "a", 1, 0, 1100000).upper,
            bishfpm_rate_decay(DBL_MAX, 1100000, 1000));
   assert(d->query_text(state, "a", 1, 0, 1100000).upper > 0);
@@ -165,25 +94,25 @@ static void cases(void) {
   assert(d->create(&h, config, &state));
 #define ADD(key, w) d->update_text(state, key, strlen(key), 0, w, 0)
 #define GET(key, t) d->query_text(state, key, strlen(key), 0, t)
-  /* Exact cells don't touch the wave. Full-bucket misses do, even if absent. */
+  /* exact cells don't touch the wave; full-bucket misses do, even if absent */
   assert(ADD(positive, 2).outcome == BISHFPM_UPDATE_ADMITTED);
   assert(GET(negative[0], 0).upper == 0);
   bishfpm_store_count_t r = ADD(negative[0], 2);
   assert(!r.resident && r.outcome == BISHFPM_UPDATE_FILTERED && r.upper == 2);
   assert(GET(positive, 0).upper == 2);
-  /* Compare BEFORE adding the incoming weight; equality permits eviction.
-   * Transfer the exact victim's signed count: wave=-3+2=-1. */
+  /* compare before adding the incoming weight; equality permits eviction;
+   * transfer the exact victim's signed count: wave=-3+2=-1 */
   r = ADD(negative[0], 1);
   assert(r.resident && r.outcome == BISHFPM_UPDATE_REPLACED && r.upper == 3);
   assert(GET(negative[1], 0).upper == 1);
-  assert(GET(positive, 0).upper == 0); /* Negative projection is clipped. */
+  assert(GET(positive, 0).upper == 0); /* negative projection is clipped */
   assert(ADD(negative[0], 2).upper ==
-         5); /* Approximate hit updates wave to -3. */
+         5); /* approximate hit updates wave to -3 */
   assert(ADD(negative[1], 1).outcome == BISHFPM_UPDATE_FILTERED);
   assert(ADD(negative[1], 1).outcome == BISHFPM_UPDATE_FILTERED);
   r = ADD(negative[1], .5);
   assert(r.outcome == BISHFPM_UPDATE_REPLACED && r.upper == 5.5);
-  /* The approximate victim is already in the wave; never transfer twice. */
+  /* the approximate victim is already in the wave; never transfer twice */
   assert(GET(negative[0], 0).upper == 5.5);
   assert(d->prune(state, 0, 100) == 0);
   assert(d->update_text(state, "unused", 6, 0, 0, 99999).outcome ==
@@ -198,8 +127,8 @@ static void cases(void) {
   assert(ADD(positive, 1).resident);
   assert(ADD(negative[0], DBL_MAX).outcome == BISHFPM_UPDATE_FILTERED);
   assert(GET(negative[0], 0).upper == DBL_MAX);
-  /* The heavy cell underflows first. Nonzero negative wave history keeps
-   * the bucket intact, even when its standalone decay factor is zero. */
+  /* the heavy cell underflows first; nonzero negative wave history keeps
+   * the bucket intact, even when its standalone decay factor is zero */
   assert(d->prune(state, 1100000, 100) == 0);
   assert(GET(positive, 1100000).resident);
   assert(GET(positive, 1100000).upper == 0);
@@ -213,15 +142,9 @@ static void cases(void) {
 #undef ADD
 #undef GET
 }
-/* Independent per-identity model, eagerly decaying ALL buckets on every step.
- * It tracks a slot number for deterministic minimum ties, without mirroring
- * the backend's cell arrays or lazy per-bucket timestamps. */
-static uint64_t random64(uint64_t *state) {
-  uint64_t z = (*state += UINT64_C(0x9e3779b97f4a7c15));
-  z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-  z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
-  return z ^ (z >> 31);
-}
+/* independent per-identity model, eagerly decaying all buckets on every step;
+ * tracks a slot number for deterministic minimum ties, without mirroring
+ * the backend's cell arrays or lazy per-bucket timestamps */
 static void reference_replay(void) {
   for (unsigned test = 0; test < 6; test++) {
     bishfpm_config_t c = mining();
@@ -248,9 +171,9 @@ static void reference_replay(void) {
     unsigned filtered = 0, exact_evictions = 0, approx_evictions = 0;
     uint64_t rng = 123, time = 0;
     for (unsigned step = 0; step < 3000; step++) {
-      unsigned key = random64(&rng) % 31, b = bucket[key];
-      double weight = .1 + (random64(&rng) % 100003) / 7001.;
-      uint64_t dt = random64(&rng) % 17;
+      unsigned key = bishfpm_splitmix64(&rng) % 31, b = bucket[key];
+      double weight = .1 + (bishfpm_splitmix64(&rng) % 100003) / 7001.;
+      uint64_t dt = bishfpm_splitmix64(&rng) % 17;
       time += dt;
       double factor = exp2(-(double)dt / 1000);
       for (unsigned i = 0; i < 31; i++) {
@@ -300,7 +223,7 @@ static void reference_replay(void) {
           filtered++;
         }
       }
-      /* All identities deliberately share the caller's hash prefilter. */
+      /* all identities deliberately share the caller's hash prefilter */
       assert(d->update_text(state, "zero", 4, 0, 0, time + 99999).outcome ==
              BISHFPM_UPDATE_ZERO);
       bishfpm_store_count_t result =
@@ -329,78 +252,6 @@ static void reference_replay(void) {
     assert(!l.bytes);
   }
 }
-static void alert(const char *group, const bishfpm_trigger_t *t, void *ctx) {
-  bishfpm_t *e = ctx;
-  assert(!strcmp(group, "g"));
-  assert(t->pattern_rate >= 1);
-  assert(isinf(t->pattern_upper_bound) && isinf(t->pattern_error));
-  bishfpm_count_bounds_t b;
-  assert(bishfpm_pattern_bounds(e, group, t->pattern, t->timestamp, &b));
-  assert(b.resident && !b.known && b.lower == 0 && isinf(b.upper));
-  close_to(bishfpm_pattern_rate(e, group, t->pattern, t->timestamp),
-           t->pattern_rate);
-}
-static bishfpm_t *engine(bishfpm_config_t *c, bishfpm_wavingsketch_options_t *s,
-                         int dynamic) {
-  bishfpm_store_engine_options_t o;
-  bishfpm_store_engine_options_default(&o);
-  o.memory_mode =
-      dynamic ? BISHFPM_MEMORY_DYNAMIC : BISHFPM_MEMORY_CONSERVATIVE;
-  return bishfpm_create_with_store(c, &o, d, s, sizeof(*s));
-}
-static void engines(int dynamic) {
-  bishfpm_config_t c = mining();
-  bishfpm_wavingsketch_options_t s = {1, 16};
-  bishfpm_t *e = engine(&c, &s, dynamic);
-  assert(e);
-  s.buckets = 0; /* Config is owned after construction. */
-  assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 3, alert, e) == 4);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1.5);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 3);
-  assert(bishfpm_add_event_weighted(e, "g", 1000, items, 3, 2, alert, e) == 4);
-  assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 2, NULL, NULL) >= 0);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 4.5);
-  bishfpm_stats_t st;
-  bishfpm_get_stats(e, &st);
-  bishfpm_memory_stats_t m;
-  bishfpm_get_memory_stats(e, &m);
-  assert(st.memory_current_bytes == m.current_bytes &&
-         m.current_bytes <= st.memory_bound_bytes);
-  if (dynamic)
-    assert(m.current_bytes <= m.peak_bytes && m.peak_bytes <= m.limit_bytes);
-  bishfpm_store_snapshot_t snap;
-  assert(bishfpm_get_store_snapshot(e, "g", sizeof(snap), &snap));
-  assert(snap.resident_patterns == 4 && snap.resident_capacity == 16 &&
-         snap.diagnostic[0] == 1 && snap.diagnostic[1] == 16);
-  assert(bishfpm_prune(e, 1000000, .1) == 1);
-  assert(bishfpm_add_event(e, "g", 0, items, 3, alert, e) == 4);
-  if (!dynamic) {
-    c.max_memory_bytes = st.memory_bound_bytes - 1;
-    s.buckets = 1;
-    assert(!engine(&c, &s, dynamic));
-  }
-  bishfpm_free(e);
-  c = mining();
-  c.max_items_per_group = 2;
-  s.buckets = 1;
-  e = engine(&c, &s, dynamic);
-  assert(e);
-  assert(bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL) == -1);
-  assert(bishfpm_group_rate(e, "g", 1000) == 0);
-  assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
-  assert(bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL) == -1);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 1);
-  assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 2);
-  bishfpm_free(e);
-}
-static void confirmed_alert(const char *group, const bishfpm_trigger_t *t,
-                            void *ctx) {
-  (void)group;
-  (*(unsigned *)ctx)++;
-  close_to(t->pattern_rate, 3);
-  assert(isinf(t->pattern_upper_bound) && isinf(t->pattern_error));
-}
 static void admission_evidence(int dynamic) {
   bishfpm_config_t c = mining();
   c.max_itemset_order = 2;
@@ -417,22 +268,21 @@ static void admission_evidence(int dynamic) {
   }
   const char *p[] = {"anchor", positive}, *n[] = {"anchor", negative};
   bishfpm_wavingsketch_options_t options = {1, 1};
-  bishfpm_t *e = engine(&c, &options, dynamic);
+  bishfpm_t *e = create_with_options(d, &c, &options, sizeof(options), dynamic);
   assert(e);
   unsigned alerts = 0;
   assert(bishfpm_add_event_weighted(e, "g", 0, p, 2, 2, confirmed_alert,
                                     &alerts) == 0);
   assert(bishfpm_add_event_weighted(e, "g", 0, n, 2, 2, confirmed_alert,
                                     &alerts) == 0);
-  /* The earlier nonresident update is discovery history, not admission
-   * evidence. */
+  /* earlier nonresident update is discovery history, not admission evidence */
   assert(bishfpm_add_event(e, "g", 0, n, 2, confirmed_alert, &alerts) == 0);
   snprintf(pattern, sizeof(pattern), "anchor\037%s", negative);
   assert(bishfpm_pattern_rate(e, "g", pattern, 0) == 3);
   assert(bishfpm_add_event_weighted(e, "g", 0, n, 2, 2, confirmed_alert,
                                     &alerts) == 1);
   assert(bishfpm_pattern_rate(e, "g", pattern, 0) == 5);
-  /* At t=1000, evidence=1.5+1; the raw estimate is already 3.5. */
+  /* at t=1000, evidence=1.5+1; the raw estimate is already 3.5 */
   assert(bishfpm_add_event(e, "g", 1000, n, 2, confirmed_alert, &alerts) == 0);
   assert(bishfpm_add_event(e, "g", 0, n, 2, confirmed_alert, &alerts) == 1);
   assert(alerts == 2);
@@ -442,9 +292,9 @@ static void admission_evidence(int dynamic) {
          isinf(bounds.upper));
   bishfpm_free(e);
 }
-/* Unrelated bucket traffic must not repeatedly round another identity's
- * evidence. At t=3 eager decay rounds 5 ulps -> 2 -> 1 -> 0, while the
- * matching-update counter correctly retains round(5/8) == 1 ulp. */
+/* unrelated bucket traffic must not repeatedly round another identity's
+ * evidence; at t=3 eager decay rounds 5 ulps -> 2 -> 1 -> 0, while the
+ * matching-update counter correctly retains round(5/8) == 1 ulp */
 static void lazy_evidence(void) {
   bishfpm_config_t c = mining();
   c.ewma_half_life_ms = 1;
@@ -461,7 +311,7 @@ static void lazy_evidence(void) {
     assert(d->update_text(state, "b", 1, 2, 1, now).resident);
   bishfpm_store_count_t r = d->query_text(state, "a", 1, 1, 3);
   assert(r.resident && r.upper == 0 && r.lower == tiny);
-  /* Future zero updates and queries cannot consume the resident's evidence. */
+  /* future zero updates and queries cannot consume the resident's evidence */
   assert(d->update_text(state, "a", 1, 1, 0, 10000).lower == 0);
   assert(d->query_text(state, "a", 1, 1, 0).lower == tiny);
   r = d->update_text(state, "a", 1, 1, 2 * tiny, 3);
@@ -474,8 +324,8 @@ static void lazy_evidence(void) {
   assert(d->update_text(state, "b", 1, 2, tiny, 0).resident);
   for (uint64_t now = 1; now <= 3; now++)
     assert(d->update_text(state, "b", 1, 2, tiny, now).resident);
-  /* At t=4 both heavy counts and wave are zero, but independently decayed
-   * evidence retains one ulp. Pruning must preserve that evidence. */
+  /* at t=4 both heavy counts and wave are zero, but independently decayed
+   * evidence retains one ulp; pruning must preserve that evidence */
   assert(d->prune(state, 4, 0) == 0);
   r = d->query_text(state, "a", 1, 1, 4);
   assert(r.resident && r.upper == 0 && r.lower == tiny);
@@ -484,59 +334,19 @@ static void lazy_evidence(void) {
   d->destroy_config(&h, config);
   assert(l.bytes == 0);
 }
-static void failures(int dynamic) {
-  unsigned constructor_failures = 0, rejected = 0;
-  for (long fault = 0; fault < 24; fault++) {
-    bishfpm_config_t c = mining();
-    bishfpm_wavingsketch_options_t s = {1, 16};
-    calls = 0;
-    fail_at = fault;
-    bishfpm_t *e = engine(&c, &s, dynamic);
-    fail_at = -1;
-    if (e)
-      bishfpm_free(e);
-    else
-      constructor_failures++;
-  }
-  for (long fault = 0; fault < 24; fault++) {
-    bishfpm_config_t c = mining();
-    bishfpm_wavingsketch_options_t s = {1, 16};
-    bishfpm_t *e = engine(&c, &s, dynamic);
-    assert(e);
-    calls = 0;
-    fail_at = fault;
-    int result = bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL);
-    fail_at = -1;
-    if (result < 0) {
-      rejected++;
-      assert(bishfpm_group_rate(e, "g", 0) == 0);
-      assert(bishfpm_add_event(e, "g", 0, items, 3, NULL, NULL) == 4);
-      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 1);
-    } else
-      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1);
-    bishfpm_free(e);
-  }
-  assert(constructor_failures >= 8 && rejected >= 9);
-}
 int main(void) {
-  assert(d->capabilities ==
-         (BISHFPM_STORE_HEURISTIC_ESTIMATES | BISHFPM_STORE_ALERT_EVIDENCE));
+  bishfpm_wavingsketch_options_t s = {1, 16};
+  check_heuristic_capabilities(
+      d, BISHFPM_STORE_HEURISTIC_ESTIMATES | BISHFPM_STORE_ALERT_EVIDENCE, &s,
+      sizeof(s));
   primitives();
   reference_replay();
   lazy_evidence();
   cases();
   for (int dynamic = 0; dynamic < 2; dynamic++) {
-    engines(dynamic);
+    check_heuristic_engines(d, &s, sizeof(s), dynamic, 1, 16);
     admission_evidence(dynamic);
-    failures(dynamic);
+    check_heuristic_failures(d, &s, sizeof(s), dynamic, 9);
   }
-  bishfpm_config_t c = mining();
-  bishfpm_wavingsketch_options_t s = {1, 16};
-  bishfpm_store_descriptor_t invalid = *d;
-  invalid.capabilities |= BISHFPM_STORE_RESIDENT_BOUNDS;
-  assert(!bishfpm_create_with_store(&c, NULL, &invalid, &s, sizeof(s)));
-  invalid = *d;
-  invalid.capabilities |= BISHFPM_STORE_ABSENT_BOUNDS;
-  assert(!bishfpm_create_with_store(&c, NULL, &invalid, &s, sizeof(s)));
   puts("test_wavingsketch passed.");
 }

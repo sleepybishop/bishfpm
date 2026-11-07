@@ -1,13 +1,7 @@
 /* EWMA-decayed HeavyKeeper store plugin using only installed public interfaces
  */
-#include "bishfpm_hash.h"
 #include "bishfpm_heavykeeper.h"
-#include "bishfpm_rate.h"
-#include <float.h>
-#include <math.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
+#include "plugin_common.h"
 
 typedef struct {
   uint64_t hash;
@@ -16,11 +10,6 @@ typedef struct {
   uint16_t length;
   char pattern[BISHFPM_MAX_PATTERN_LEN];
 } hk_entry_t;
-typedef struct {
-  uint64_t hash;
-  uint32_t heap_idx;
-  bool occupied;
-} hk_slot_t;
 typedef struct {
   double rate;
   uint64_t time_ms;
@@ -36,28 +25,15 @@ typedef struct {
   const hk_config_t *config;
   uint32_t heap_size;
   hk_entry_t *heap;
-  hk_slot_t *slot_map;
+  plugin_text_slot_t *slot_map;
   hk_bucket_t *hk;
   uint64_t rng_state, max_time_ms;
-  double hk_total;
+  double total;
 } hk_store_t;
-static uint64_t effective_time(uint64_t a, uint64_t b) { return a > b ? a : b; }
-static inline double decay_since(double count, uint64_t then, uint64_t now,
-                                 double half) {
-  return now <= then ? count : bishfpm_rate_decay(count, now - then, half);
-}
-static bool checked_add(size_t a, size_t b, size_t *out) {
-  if (b > SIZE_MAX - a)
-    return false;
-  *out = a + b;
-  return true;
-}
-static bool checked_mul(size_t a, size_t b, size_t *out) {
-  if (a && b > SIZE_MAX / a)
-    return false;
-  *out = a * b;
-  return true;
-}
+#define PLUGIN_STORE_T hk_store_t
+#define PLUGIN_ENTRY_T hk_entry_t
+#include "plugin_common.h"
+
 void bishfpm_heavykeeper_options_default(bishfpm_heavykeeper_options_t *o) {
   if (o)
     *o = (bishfpm_heavykeeper_options_t){64, 4, 256, .95};
@@ -82,43 +58,17 @@ static bool configure(const bishfpm_config_t *mining, const void *raw, size_t n,
   c->options.decay_base = base;
   c->half_life_ms = mining->ewma_half_life_ms;
   c->seed = mining->hash_seed;
-  c->slots = 16;
-  while (c->slots < (size_t)o->capacity * 2)
-    c->slots *= 2;
+  c->slots = plugin_slots(o->capacity);
   size_t cells, total = sizeof(hk_store_t);
   return checked_mul(o->capacity, sizeof(hk_entry_t), &c->heap_bytes) &&
-         checked_mul(c->slots, sizeof(hk_slot_t), &c->map_bytes) &&
+         checked_mul(c->slots, sizeof(plugin_text_slot_t), &c->map_bytes) &&
          checked_mul(o->depth, o->width, &cells) &&
          checked_mul(cells, sizeof(hk_bucket_t), &c->bucket_bytes) &&
          checked_add(total, c->heap_bytes, &total) &&
          checked_add(total, c->map_bytes, &total) &&
          checked_add(total, c->bucket_bytes, &c->group_bytes);
 }
-static int plan(const bishfpm_config_t *m, const void *raw, size_t n,
-                bishfpm_store_plan_t *out) {
-  hk_config_t c;
-  if (!out || !configure(m, raw, n, &c))
-    return 0;
-  *out = (bishfpm_store_plan_t){
-      sizeof(c), c.group_bytes, 1, BISHFPM_MAX_ITEMSET_ORDER, {0, 0}};
-  return 1;
-}
-static int clone_config(const bishfpm_store_host_t *h,
-                        const bishfpm_config_t *m, const void *raw, size_t n,
-                        void **out) {
-  hk_config_t c;
-  if (!h || !out || !configure(m, raw, n, &c))
-    return 0;
-  hk_config_t *owned = h->allocate(h->context, sizeof(*owned));
-  if (!owned)
-    return 0;
-  *owned = c;
-  *out = owned;
-  return 1;
-}
-static void destroy_config(const bishfpm_store_host_t *h, void *c) {
-  h->release(h->context, c, sizeof(hk_config_t));
-}
+BISHFPM_PLUGIN_CONFIG_OPS(hk_config_t, 1, BISHFPM_MAX_ITEMSET_ORDER)
 static void destroy(const bishfpm_store_host_t *h, void *raw) {
   hk_store_t *s = raw;
   const hk_config_t *c = s->config;
@@ -144,172 +94,6 @@ static int create(const bishfpm_store_host_t *h, const void *raw, void **out) {
   *out = s;
   return 1;
 }
-static int prepare(void *state, const bishfpm_store_event_t *event,
-                   void **token) {
-  (void)state;
-  (void)event;
-  *token = NULL;
-  return 1;
-}
-static void complete(void *state, void *token) {
-  (void)state;
-  (void)token;
-}
-static inline void copy_entry(hk_entry_t *dst, const hk_entry_t *src) {
-  memcpy(dst, src, offsetof(hk_entry_t, pattern) + src->length + 1);
-}
-
-/* find slot in hash map */
-static int slot_map_find(const hk_store_t *topk, const char *pattern,
-                         size_t length, uint64_t hash, uint32_t *out_idx) {
-  size_t cap = topk->config->slots, mask = cap - 1;
-  size_t idx = (size_t)(hash & mask);
-
-  for (size_t i = 0; i < cap; i++) {
-    size_t s = (idx + i) & mask;
-    if (!topk->slot_map[s].occupied) {
-      return 0;
-    }
-    if (topk->slot_map[s].hash == hash) {
-      uint32_t h_idx = topk->slot_map[s].heap_idx;
-      if (topk->heap[h_idx].length == length &&
-          memcmp(topk->heap[h_idx].pattern, pattern, length) == 0) {
-        if (out_idx) {
-          *out_idx = h_idx;
-        }
-        return 1;
-      }
-    }
-  }
-  return 0;
-}
-
-/* set slot in hash map */
-static void slot_map_set(hk_store_t *topk, uint64_t hash, uint32_t heap_idx) {
-  size_t cap = topk->config->slots, mask = cap - 1;
-  size_t idx = (size_t)(hash & mask);
-
-  for (size_t i = 0; i < cap; i++) {
-    size_t s = (idx + i) & mask;
-    if (!topk->slot_map[s].occupied) {
-      topk->slot_map[s].hash = hash;
-      topk->slot_map[s].heap_idx = heap_idx;
-      topk->slot_map[s].occupied = true;
-      return;
-    }
-  }
-}
-
-/* locate by old heap position and hash before moving */
-static size_t slot_for_index(const hk_store_t *topk, uint32_t index) {
-  size_t mask = topk->config->slots - 1;
-  size_t slot = topk->heap[index].hash & mask;
-  while (!topk->slot_map[slot].occupied ||
-         topk->slot_map[slot].heap_idx != index)
-    slot = (slot + 1) & mask;
-  return slot;
-}
-
-/* remove slot from hash map using backward shift */
-static void slot_map_remove(hk_store_t *topk, uint32_t heap_idx) {
-  size_t mask = topk->config->slots - 1;
-  size_t j = slot_for_index(topk, heap_idx);
-  for (size_t k = (j + 1) & mask; topk->slot_map[k].occupied;
-       k = (k + 1) & mask) {
-    size_t orig = (size_t)(topk->slot_map[k].hash & mask);
-    if (((k - orig) & mask) >= ((k - j) & mask)) {
-      topk->slot_map[j] = topk->slot_map[k];
-      j = k;
-    }
-  }
-  topk->slot_map[j] = (hk_slot_t){0};
-}
-
-static void slot_map_rebuild(hk_store_t *topk) {
-  memset(topk->slot_map, 0, topk->config->slots * sizeof(*topk->slot_map));
-  for (uint32_t i = 0; i < topk->heap_size; i++)
-    slot_map_set(topk, topk->heap[i].hash, i);
-}
-
-/* compute decayed item rate */
-static inline double item_rate(const hk_entry_t *item, uint64_t now_ms,
-                               double half_life_ms) {
-  return decay_since(item->rate, item->last_time_ms, now_ms, half_life_ms);
-}
-
-/* sift up in min-heap */
-static void heapify_up(hk_store_t *topk, uint32_t idx, uint64_t now_ms) {
-  if (!idx)
-    return;
-  double half = topk->config->half_life_ms;
-  uint32_t parent = (idx - 1) / 2;
-  double rate = item_rate(&topk->heap[idx], now_ms, half);
-  if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
-    return;
-  hk_entry_t held;
-  copy_entry(&held, &topk->heap[idx]);
-  size_t held_slot = slot_for_index(topk, idx);
-  uint32_t hole = idx;
-  for (;;) {
-    size_t slot = slot_for_index(topk, parent);
-    copy_entry(&topk->heap[hole], &topk->heap[parent]);
-    topk->slot_map[slot].heap_idx = hole;
-    hole = parent;
-    if (!hole)
-      break;
-    parent = (hole - 1) / 2;
-    if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
-      break;
-  }
-  copy_entry(&topk->heap[hole], &held);
-  topk->slot_map[held_slot].heap_idx = hole;
-}
-
-/* sift down in min-heap */
-static void heapify_down(hk_store_t *topk, uint32_t idx, uint64_t now_ms) {
-  uint32_t child = 2 * idx + 1;
-  if (child >= topk->heap_size)
-    return;
-  double half = topk->config->half_life_ms;
-  double held_rate = item_rate(&topk->heap[idx], now_ms, half);
-  double child_rate = item_rate(&topk->heap[child], now_ms, half);
-  if (child + 1 < topk->heap_size) {
-    double right_rate = item_rate(&topk->heap[child + 1], now_ms, half);
-    if (right_rate < child_rate) {
-      child++;
-      child_rate = right_rate;
-    }
-  }
-  if (!(child_rate < held_rate))
-    return;
-  /* carry updated entry through a hole and copy only active pattern bytes */
-  hk_entry_t held;
-  copy_entry(&held, &topk->heap[idx]);
-  size_t held_slot = slot_for_index(topk, idx);
-  uint32_t hole = idx;
-  for (;;) {
-    size_t child_slot = slot_for_index(topk, child);
-    copy_entry(&topk->heap[hole], &topk->heap[child]);
-    topk->slot_map[child_slot].heap_idx = hole;
-    hole = child;
-    child = 2 * hole + 1;
-    if (child >= topk->heap_size)
-      break;
-    child_rate = item_rate(&topk->heap[child], now_ms, half);
-    if (child + 1 < topk->heap_size) {
-      double right_rate = item_rate(&topk->heap[child + 1], now_ms, half);
-      if (right_rate < child_rate) {
-        child++;
-        child_rate = right_rate;
-      }
-    }
-    if (!(child_rate < held_rate))
-      break;
-  }
-  copy_entry(&topk->heap[hole], &held);
-  topk->slot_map[held_slot].heap_idx = hole;
-}
-
 /* integer weights use geometric skips of Bernoulli trials; fractional
  * remainders use one proportional decrement trial */
 static double hk_uniform(hk_store_t *t) {
@@ -418,12 +202,12 @@ static bishfpm_store_count_t update_text(void *raw, const char *pattern,
     return query_text(t, pattern, length, hash, now);
   bishfpm_store_count_t r = {0};
   double half = t->config->half_life_ms;
-  double total = decay_since(t->hk_total, t->max_time_ms, now, half);
+  double total = decay_since(t->total, t->max_time_ms, now, half);
   double estimate;
   if (!(weight > 0) || weight > DBL_MAX - total ||
       !hk_update(t, pattern, length, weight, now, &estimate))
     return r;
-  t->hk_total = total + weight;
+  t->total = total + weight;
   t->max_time_ms = now;
   uint32_t idx, k = t->config->options.capacity;
   bool present = slot_map_find(t, pattern, length, hash, &idx);
@@ -437,9 +221,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *pattern,
     idx = full ? 0 : t->heap_size++;
     if (full)
       slot_map_remove(t, 0);
-    memcpy(t->heap[idx].pattern, pattern, length + 1);
-    t->heap[idx].length = (uint16_t)length;
-    t->heap[idx].hash = hash;
+    entry_identity(&t->heap[idx], pattern, length, hash);
   }
   t->heap[idx].rate = estimate;
   t->heap[idx].last_time_ms = now;
@@ -456,28 +238,7 @@ static bishfpm_store_count_t update_text(void *raw, const char *pattern,
   return r;
 }
 static size_t prune(void *raw, uint64_t now, double cutoff) {
-  hk_store_t *s = raw;
-  double half = s->config->half_life_ms;
-  now = effective_time(now, s->max_time_ms);
-  s->hk_total = decay_since(s->hk_total, s->max_time_ms, now, half);
-  s->max_time_ms = now;
-  uint32_t i = 0;
-  size_t removed = 0;
-  while (i < s->heap_size) {
-    if (item_rate(&s->heap[i], now, half) < cutoff) {
-      --s->heap_size;
-      if (i < s->heap_size)
-        copy_entry(&s->heap[i], &s->heap[s->heap_size]);
-      removed++;
-    } else
-      i++;
-  }
-  if (removed) {
-    slot_map_rebuild(s);
-    for (uint32_t j = s->heap_size / 2; j > 0; j--)
-      heapify_down(s, j - 1, now);
-  }
-  return removed;
+  return heap_prune(raw, now, cutoff, false);
 }
 static void snapshot(const void *raw, bishfpm_store_snapshot_t *out) {
   const hk_store_t *s = raw;

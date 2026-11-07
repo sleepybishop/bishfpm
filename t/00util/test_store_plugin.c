@@ -1,53 +1,22 @@
 #include "examples/exact_store.h"
-#include <assert.h>
-#include <math.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "plugin_test.h"
 
-/* deterministic denial at every constructor and required event allocation */
-void *__real_malloc(size_t);
-void *__real_calloc(size_t, size_t);
-char *__real_strdup(const char *);
-static long fail_at = -1, allocations;
-static int deny(void) { return fail_at >= 0 && allocations++ == fail_at; }
-void *__wrap_malloc(size_t n) { return deny() ? NULL : __real_malloc(n); }
-void *__wrap_calloc(size_t n, size_t z) {
-  return deny() ? NULL : __real_calloc(n, z);
-}
-char *__wrap_strdup(const char *s) { return deny() ? NULL : __real_strdup(s); }
 static const char *ab[] = {"a", "b"};
 static const char *abc[] = {"a", "b", "c"};
 static const char *keys[] = {"a", "b", "c", "d", "e", "f"};
 static const char *patterns[] = {"a\037b", "a\037c", "b\037c"};
 static bishfpm_config_t config(void) {
-  bishfpm_config_t c;
-  bishfpm_config_default(&c);
-  c.min_itemset_order = c.max_itemset_order = 2;
-  c.item_rate_threshold = c.item_share_threshold = 0;
-  c.min_pattern_rate = c.promotion_fraction = 0;
-  c.trigger_cooldown_ms = 0;
-  c.max_groups = 2;
-  c.max_event_items = 8;
-  c.max_items_per_group = 8;
-  c.ewma_half_life_ms = 1000;
+  bishfpm_config_t c = mining();
+  c.max_itemset_order = 2;
+  c.min_pattern_rate = 0;
   return c;
 }
 static bishfpm_t *create(bishfpm_config_t *c, unsigned rep, int dynamic,
                          unsigned capacity) {
   exact_store_options_t s = {capacity, rep, "owned configuration"};
-  bishfpm_store_engine_options_t o;
-  bishfpm_store_engine_options_default(&o);
-  o.memory_mode =
-      dynamic ? BISHFPM_MEMORY_DYNAMIC : BISHFPM_MEMORY_CONSERVATIVE;
-  return bishfpm_create_with_store(
-      c, &o, rep == BISHFPM_STORE_TEXT ? &exact_text_store : &exact_pair_store,
-      &s, sizeof(s));
-}
-static void close_to(double value, long double expected) {
-  assert(fabsl(value - expected) <= 5e-12L * fmaxl(1, fabsl(expected)));
+  return create_with_options(rep == BISHFPM_STORE_TEXT ? &exact_text_store
+                                                       : &exact_pair_store,
+                             c, &s, sizeof(s), dynamic);
 }
 static void check_count(bishfpm_t *e, const char *p, uint64_t time,
                         long double expected) {
@@ -72,7 +41,7 @@ static void failures(unsigned rep, int dynamic) {
   bishfpm_config_t c = config();
   unsigned constructor_failures = 0, event_failures = 0;
   for (long fault = 0; fault < 16; fault++) {
-    allocations = 0;
+    calls = 0;
     fail_at = fault;
     bishfpm_t *e = create(&c, rep, dynamic, 16);
     fail_at = -1;
@@ -88,7 +57,7 @@ static void failures(unsigned rep, int dynamic) {
   for (long fault = 0; fault < 20; fault++) {
     bishfpm_t *e = create(&c, rep, dynamic, 16);
     assert(e);
-    allocations = 0;
+    calls = 0;
     fail_at = fault;
     int result = bishfpm_add_event(e, "g", 1000, abc, 3, NULL, NULL);
     fail_at = -1;

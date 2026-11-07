@@ -154,6 +154,7 @@ test ! -e "$stage/usr/include/internal.h"
 test ! -e "$stage/usr/include/state.h"
 test ! -e "$stage/usr/include/store.h"
 test ! -e "$stage/usr/include/store_plugin.h"
+test ! -e "$stage/usr/include/plugin_common.h"
 if nm -D --defined-only "$stage/usr/lib/libbishfpm.so" | \
     awk '{print $3}' | \
     grep -Eq '^(topk_add_result|topk_add_sized|topk_query_result|rate_table_find|rate_table_new_budget|rate_table_prepare_result|arena_new_budget|bishfpm_arena_init|compact_.*|store_.*)$'; then

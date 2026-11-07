@@ -1,75 +1,7 @@
-#include "bishfpm_hash.h"
 #include "bishfpm_heavykeeper.h"
-#include "bishfpm_rate.h"
-#include <assert.h>
-#include <float.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "plugin_test.h"
 
-void *__real_malloc(size_t);
-void *__real_calloc(size_t, size_t);
-char *__real_strdup(const char *);
-static long fail_at = -1, calls;
-static int deny(void) { return fail_at >= 0 && calls++ == fail_at; }
-void *__wrap_malloc(size_t n) { return deny() ? NULL : __real_malloc(n); }
-void *__wrap_calloc(size_t n, size_t s) {
-  return deny() ? NULL : __real_calloc(n, s);
-}
-char *__wrap_strdup(const char *s) { return deny() ? NULL : __real_strdup(s); }
-
-typedef struct {
-  size_t bytes, peak;
-  long fail, allocs;
-} ledger_t;
-static void *allocate(void *ctx, size_t n) {
-  ledger_t *l = ctx;
-  if (l->fail >= 0 && l->allocs++ == l->fail)
-    return NULL;
-  void *p = malloc(n);
-  if (p) {
-    l->bytes += n;
-    if (l->bytes > l->peak)
-      l->peak = l->bytes;
-  }
-  return p;
-}
-static void *zeroed(void *ctx, size_t n, size_t size) {
-  assert(!n || size <= SIZE_MAX / n);
-  void *p = allocate(ctx, n * size);
-  if (p)
-    memset(p, 0, n * size);
-  return p;
-}
-static void release(void *ctx, void *p, size_t n) {
-  ledger_t *l = ctx;
-  if (p) {
-    assert(l->bytes >= n);
-    l->bytes -= n;
-    free(p);
-  }
-}
-static bishfpm_config_t mining(void) {
-  bishfpm_config_t c;
-  bishfpm_config_default(&c);
-  c.min_itemset_order = 2;
-  c.max_itemset_order = 3;
-  c.item_rate_threshold = c.item_share_threshold = c.promotion_fraction = 0;
-  c.min_pattern_rate = 1;
-  c.trigger_cooldown_ms = 0;
-  c.ewma_half_life_ms = 1000;
-  c.max_groups = 2;
-  c.max_items_per_group = 8;
-  c.max_event_items = 8;
-  c.hash_seed = 42;
-  return c;
-}
 static const bishfpm_store_descriptor_t *d = &bishfpm_heavykeeper_store;
-static const char *items[] = {"a", "b", "c"};
-static void close_to(double x, double y) {
-  assert(fabs(x - y) <= 1e-10 * fmax(1, fabs(y)));
-}
 static void primitives(void) {
   bishfpm_config_t c = mining();
   bishfpm_heavykeeper_options_t o = {7, 4, 17, .95};
@@ -224,71 +156,6 @@ static void identity_collisions(void) {
   d->destroy_config(&host, config);
   assert(!l.bytes);
 }
-static void alert(const char *group, const bishfpm_trigger_t *t, void *ctx) {
-  bishfpm_t *e = ctx;
-  assert(!strcmp(group, "g"));
-  assert(t->pattern_rate >= 1);
-  assert(isinf(t->pattern_upper_bound) && isinf(t->pattern_error));
-  bishfpm_count_bounds_t b;
-  assert(bishfpm_pattern_bounds(e, group, t->pattern, t->timestamp, &b));
-  assert(b.resident && !b.known && b.lower == 0 && isinf(b.upper));
-  close_to(bishfpm_pattern_rate(e, group, t->pattern, t->timestamp),
-           t->pattern_rate);
-}
-static bishfpm_t *engine(bishfpm_config_t *c, bishfpm_heavykeeper_options_t *s,
-                         int dynamic) {
-  bishfpm_store_engine_options_t o;
-  bishfpm_store_engine_options_default(&o);
-  o.memory_mode =
-      dynamic ? BISHFPM_MEMORY_DYNAMIC : BISHFPM_MEMORY_CONSERVATIVE;
-  return bishfpm_create_with_store(c, &o, d, s, sizeof(*s));
-}
-static void engines(int dynamic) {
-  bishfpm_config_t c = mining();
-  bishfpm_heavykeeper_options_t s = {16, 4, 17, .95};
-  bishfpm_t *e = engine(&c, &s, dynamic);
-  assert(e);
-  s.capacity = 0; /* config is owned after construction */
-  assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 3, alert, e) == 4);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1.5);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 3);
-  assert(bishfpm_add_event_weighted(e, "g", 1000, items, 3, 2, alert, e) == 4);
-  assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 2, NULL, NULL) >= 0);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 4.5);
-  bishfpm_stats_t st;
-  bishfpm_get_stats(e, &st);
-  bishfpm_memory_stats_t m;
-  bishfpm_get_memory_stats(e, &m);
-  assert(st.memory_current_bytes == m.current_bytes &&
-         m.current_bytes <= st.memory_bound_bytes);
-  if (dynamic)
-    assert(m.current_bytes <= m.peak_bytes && m.peak_bytes <= m.limit_bytes);
-  bishfpm_store_snapshot_t snap;
-  assert(bishfpm_get_store_snapshot(e, "g", sizeof(snap), &snap));
-  assert(snap.resident_patterns == 4 && snap.resident_capacity == 16 &&
-         snap.diagnostic[0] == 4);
-  assert(bishfpm_prune(e, 1000000, .1) == 1);
-  assert(bishfpm_add_event(e, "g", 0, items, 3, alert, e) == 4);
-  if (!dynamic) {
-    c.max_memory_bytes = st.memory_bound_bytes - 1;
-    s.capacity = 16;
-    assert(!engine(&c, &s, dynamic));
-  }
-  bishfpm_free(e);
-  c = mining();
-  c.max_items_per_group = 2;
-  s.capacity = 16;
-  e = engine(&c, &s, dynamic);
-  assert(e);
-  assert(bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL) == -1);
-  assert(bishfpm_group_rate(e, "g", 1000) == 0);
-  assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
-  assert(bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL) == -1);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 1);
-  assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
-  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 2);
-  bishfpm_free(e);
-}
 typedef struct {
   double rate;
   uint64_t time;
@@ -307,7 +174,7 @@ static void small_matching_updates(int dynamic) {
   c.max_itemset_order = 2;
   c.min_lift = 0;
   bishfpm_heavykeeper_options_t s = {1, 1, 1, .95};
-  bishfpm_t *e = engine(&c, &s, dynamic);
+  bishfpm_t *e = create_with_options(d, &c, &s, sizeof(s), dynamic);
   assert(e);
   /* advance group watermark with a singleton so each late unit event adds
    * 1/256 to the pair sketch */
@@ -324,7 +191,7 @@ static void small_matching_updates(int dynamic) {
   bishfpm_free(e);
 
   /* matching history survives when decay takes a counter below .01 */
-  e = engine(&c, &s, dynamic);
+  e = create_with_options(d, &c, &s, sizeof(s), dynamic);
   assert(e);
   expected = (small_update_alert_t){1, 0, 0};
   assert(bishfpm_add_event(e, "g", 0, items, 2, small_update_alert,
@@ -348,15 +215,15 @@ static void large_weight_collisions(int dynamic) {
   c.min_lift = 0;
   bishfpm_heavykeeper_options_t s = {1, 1, 1, 1 - 1e-16};
   /* reject unbounded decay bases in either input convention */
-  assert(!engine(&c, &s, dynamic));
+  assert(!create_with_options(d, &c, &s, sizeof(s), dynamic));
   s.decay_base = 1 / s.decay_base;
-  assert(!engine(&c, &s, dynamic));
+  assert(!create_with_options(d, &c, &s, sizeof(s), dynamic));
   const double bases[] = {.99, 1 / .99};
   const uint32_t weights[] = {UINT32_MAX, 1024};
   for (size_t i = 0; i < sizeof(bases) / sizeof(*bases); i++) {
     s.decay_base = bases[i];
     for (size_t j = 0; j < sizeof(weights) / sizeof(*weights); j++) {
-      bishfpm_t *e = engine(&c, &s, dynamic);
+      bishfpm_t *e = create_with_options(d, &c, &s, sizeof(s), dynamic);
       assert(e);
       uint32_t initial = weights[j];
       assert(bishfpm_add_event_weighted(e, "g", 0, items, 2, initial, NULL,
@@ -374,57 +241,17 @@ static void large_weight_collisions(int dynamic) {
     }
   }
 }
-static void failures(int dynamic) {
-  unsigned constructor_failures = 0, rejected = 0;
-  for (long fault = 0; fault < 24; fault++) {
-    bishfpm_config_t c = mining();
-    bishfpm_heavykeeper_options_t s = {16, 4, 17, .95};
-    calls = 0;
-    fail_at = fault;
-    bishfpm_t *e = engine(&c, &s, dynamic);
-    fail_at = -1;
-    if (e)
-      bishfpm_free(e);
-    else
-      constructor_failures++;
-  }
-  for (long fault = 0; fault < 24; fault++) {
-    bishfpm_config_t c = mining();
-    bishfpm_heavykeeper_options_t s = {16, 4, 17, .95};
-    bishfpm_t *e = engine(&c, &s, dynamic);
-    assert(e);
-    calls = 0;
-    fail_at = fault;
-    int result = bishfpm_add_event(e, "g", 1000, items, 3, NULL, NULL);
-    fail_at = -1;
-    if (result < 0) {
-      rejected++;
-      assert(bishfpm_group_rate(e, "g", 0) == 0);
-      assert(bishfpm_add_event(e, "g", 0, items, 3, NULL, NULL) == 4);
-      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 1);
-    } else
-      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1);
-    bishfpm_free(e);
-  }
-  assert(constructor_failures >= 8 && rejected >= 10);
-}
 int main(void) {
-  assert(d->capabilities == BISHFPM_STORE_HEURISTIC_ESTIMATES);
+  bishfpm_heavykeeper_options_t s = {16, 4, 17, .95};
+  check_heuristic_capabilities(d, BISHFPM_STORE_HEURISTIC_ESTIMATES, &s,
+                               sizeof(s));
   primitives();
   identity_collisions();
   for (int dynamic = 0; dynamic < 2; dynamic++) {
-    engines(dynamic);
+    check_heuristic_engines(d, &s, sizeof(s), dynamic, 4, 17);
     small_matching_updates(dynamic);
     large_weight_collisions(dynamic);
-    failures(dynamic);
+    check_heuristic_failures(d, &s, sizeof(s), dynamic, 10);
   }
-  bishfpm_config_t c = mining();
-  bishfpm_heavykeeper_options_t s = {16, 4, 17, .95};
-  bishfpm_store_descriptor_t invalid = *d;
-  invalid.capabilities |= BISHFPM_STORE_RESIDENT_BOUNDS;
-  assert(!bishfpm_create_with_store(&c, NULL, &invalid, &s, sizeof(s)));
-  invalid = *d;
-  invalid.capabilities |= BISHFPM_STORE_ABSENT_BOUNDS;
-  assert(!bishfpm_create_with_store(&c, NULL, &invalid, &s, sizeof(s)));
   puts("test_heavykeeper passed.");
 }

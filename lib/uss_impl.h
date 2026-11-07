@@ -1,20 +1,8 @@
 /* weighted Unbiased Space Saving (Ting, SIGMOD 2018) with pairwise unbiased
  * reduction and lazy exponential time decay using public interfaces */
-#include "bishfpm_hash.h"
-#include "bishfpm_rate.h"
 #include "bishfpm_uss.h"
-#include <float.h>
-#include <math.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <string.h>
+#include "plugin_common.h"
 
-#ifdef BISHFPM_USS_PAIR64
-typedef uint64_t uss_key_t;
-typedef uint32_t uss_slot_t; /* zero empty; otherwise heap index + 1 */
-#else
-typedef const char *uss_key_t;
-#endif
 typedef struct {
 #ifdef BISHFPM_USS_PAIR64
   uint64_t key;
@@ -28,12 +16,10 @@ typedef struct {
   char pattern[BISHFPM_MAX_PATTERN_LEN];
 #endif
 } uss_entry_t;
-#ifndef BISHFPM_USS_PAIR64
-typedef struct {
-  uint64_t hash;
-  uint32_t heap_idx;
-  bool occupied;
-} uss_slot_t;
+#ifdef BISHFPM_USS_PAIR64
+typedef uint32_t uss_slot_t;
+#else
+typedef plugin_text_slot_t uss_slot_t;
 #endif
 typedef struct {
   bishfpm_uss_options_t options;
@@ -48,23 +34,10 @@ typedef struct {
   uint64_t rng_state, max_time_ms;
   double total;
 } uss_store_t;
-static uint64_t effective_time(uint64_t a, uint64_t b) { return a > b ? a : b; }
-static inline double decay_since(double count, uint64_t then, uint64_t now,
-                                 double half) {
-  return now <= then ? count : bishfpm_rate_decay(count, now - then, half);
-}
-static bool checked_add(size_t a, size_t b, size_t *out) {
-  if (b > SIZE_MAX - a)
-    return false;
-  *out = a + b;
-  return true;
-}
-static bool checked_mul(size_t a, size_t b, size_t *out) {
-  if (a && b > SIZE_MAX / a)
-    return false;
-  *out = a * b;
-  return true;
-}
+#define PLUGIN_STORE_T uss_store_t
+#define PLUGIN_ENTRY_T uss_entry_t
+#include "plugin_common.h"
+
 #ifndef BISHFPM_USS_PAIR64
 void bishfpm_uss_options_default(bishfpm_uss_options_t *o) {
   if (o)
@@ -86,44 +59,18 @@ static bool configure(const bishfpm_config_t *mining, const void *raw, size_t n,
   *c = (uss_config_t){0};
   c->options = *o;
   c->half_life_ms = mining->ewma_half_life_ms;
-  c->slots = 16;
-  while (c->slots < (size_t)o->capacity * 2)
-    c->slots *= 2;
+  c->slots = plugin_slots(o->capacity);
   size_t total = sizeof(uss_store_t);
   return checked_mul(o->capacity, sizeof(uss_entry_t), &c->heap_bytes) &&
          checked_mul(c->slots, sizeof(uss_slot_t), &c->map_bytes) &&
          checked_add(total, c->heap_bytes, &total) &&
          checked_add(total, c->map_bytes, &c->group_bytes);
 }
-static int plan(const bishfpm_config_t *m, const void *raw, size_t n,
-                bishfpm_store_plan_t *out) {
-  uss_config_t c;
-  if (!out || !configure(m, raw, n, &c))
-    return 0;
-  *out = (bishfpm_store_plan_t){
 #ifdef BISHFPM_USS_PAIR64
-      sizeof(c), c.group_bytes, 2, 2, {0, 0}};
+BISHFPM_PLUGIN_CONFIG_OPS(uss_config_t, 2, 2)
 #else
-      sizeof(c), c.group_bytes, 1, BISHFPM_MAX_ITEMSET_ORDER, {0, 0}};
+BISHFPM_PLUGIN_CONFIG_OPS(uss_config_t, 1, BISHFPM_MAX_ITEMSET_ORDER)
 #endif
-  return 1;
-}
-static int clone_config(const bishfpm_store_host_t *h,
-                        const bishfpm_config_t *m, const void *raw, size_t n,
-                        void **out) {
-  uss_config_t c;
-  if (!h || !out || !configure(m, raw, n, &c))
-    return 0;
-  uss_config_t *owned = h->allocate(h->context, sizeof(*owned));
-  if (!owned)
-    return 0;
-  *owned = c;
-  *out = owned;
-  return 1;
-}
-static void destroy_config(const bishfpm_store_host_t *h, void *c) {
-  h->release(h->context, c, sizeof(uss_config_t));
-}
 static void destroy(const bishfpm_store_host_t *h, void *raw) {
   uss_store_t *s = raw;
   const uss_config_t *c = s->config;
@@ -147,221 +94,7 @@ static int create(const bishfpm_store_host_t *h, const void *raw, void **out) {
   *out = s;
   return 1;
 }
-static int prepare(void *state, const bishfpm_store_event_t *event,
-                   void **token) {
-  (void)state;
-  (void)event;
-  *token = NULL;
-  return 1;
-}
-static void complete(void *state, void *token) {
-  (void)state;
-  (void)token;
-}
-static inline void copy_entry(uss_entry_t *dst, const uss_entry_t *src) {
-#ifdef BISHFPM_USS_PAIR64
-  *dst = *src;
-#else
-  memcpy(dst, src, offsetof(uss_entry_t, pattern) + src->length + 1);
-#endif
-}
-static uint64_t entry_hash(const uss_entry_t *e) {
-#ifdef BISHFPM_USS_PAIR64
-  uint64_t key = e->key;
-  return bishfpm_splitmix64(&key);
-#else
-  return e->hash;
-#endif
-}
-static bool entry_matches(const uss_entry_t *e, uss_key_t key, size_t length) {
-#ifdef BISHFPM_USS_PAIR64
-  (void)length;
-  return e->key == key;
-#else
-  return e->length == length && memcmp(e->pattern, key, length) == 0;
-#endif
-}
-static void entry_identity(uss_entry_t *e, uss_key_t key, size_t length,
-                           uint64_t hash) {
-#ifdef BISHFPM_USS_PAIR64
-  (void)length;
-  (void)hash;
-  e->key = key;
-#else
-  memcpy(e->pattern, key, length + 1);
-  e->length = (uint16_t)length;
-  e->hash = hash;
-#endif
-}
-static bool slot_occupied(const uss_slot_t *s) {
-#ifdef BISHFPM_USS_PAIR64
-  return *s != 0;
-#else
-  return s->occupied;
-#endif
-}
-static uint32_t slot_index(const uss_slot_t *s) {
-#ifdef BISHFPM_USS_PAIR64
-  return *s - 1;
-#else
-  return s->heap_idx;
-#endif
-}
-static void slot_index_set(uss_slot_t *s, uint32_t index) {
-#ifdef BISHFPM_USS_PAIR64
-  *s = index + 1;
-#else
-  s->heap_idx = index;
-#endif
-}
-static uint64_t slot_hash(const uss_store_t *s, size_t slot) {
-#ifdef BISHFPM_USS_PAIR64
-  return entry_hash(&s->heap[slot_index(&s->slot_map[slot])]);
-#else
-  return s->slot_map[slot].hash;
-#endif
-}
-static int slot_map_find(const uss_store_t *s, uss_key_t key, size_t length,
-                         uint64_t hash, uint32_t *out_idx) {
-  size_t mask = s->config->slots - 1;
-  for (size_t i = 0; i < s->config->slots; i++) {
-    size_t slot = (hash + i) & mask;
-    if (!slot_occupied(&s->slot_map[slot]))
-      return 0;
-    uint32_t index = slot_index(&s->slot_map[slot]);
-#ifndef BISHFPM_USS_PAIR64
-    if (s->slot_map[slot].hash != hash)
-      continue;
-#endif
-    if (entry_matches(&s->heap[index], key, length)) {
-      if (out_idx)
-        *out_idx = index;
-      return 1;
-    }
-  }
-  return 0;
-}
-static void slot_map_set(uss_store_t *s, uint64_t hash, uint32_t index) {
-  size_t mask = s->config->slots - 1;
-  for (size_t i = 0; i < s->config->slots; i++) {
-    size_t slot = (hash + i) & mask;
-    if (!slot_occupied(&s->slot_map[slot])) {
-#ifndef BISHFPM_USS_PAIR64
-      s->slot_map[slot].hash = hash;
-      s->slot_map[slot].occupied = true;
-#endif
-      slot_index_set(&s->slot_map[slot], index);
-      return;
-    }
-  }
-}
-/* locate by original heap index before moving the row */
-static size_t slot_for_index(const uss_store_t *s, uint32_t index) {
-  size_t mask = s->config->slots - 1;
-  size_t slot = entry_hash(&s->heap[index]) & mask;
-  while (!slot_occupied(&s->slot_map[slot]) ||
-         slot_index(&s->slot_map[slot]) != index)
-    slot = (slot + 1) & mask;
-  return slot;
-}
-static void slot_map_remove(uss_store_t *s, uint32_t index) {
-  size_t mask = s->config->slots - 1, j = slot_for_index(s, index);
-  for (size_t k = (j + 1) & mask; slot_occupied(&s->slot_map[k]);
-       k = (k + 1) & mask) {
-    size_t orig = slot_hash(s, k) & mask;
-    if (((k - orig) & mask) >= ((k - j) & mask)) {
-      s->slot_map[j] = s->slot_map[k];
-      j = k;
-    }
-  }
-  s->slot_map[j] = (uss_slot_t){0};
-}
-static void slot_map_rebuild(uss_store_t *s) {
-  memset(s->slot_map, 0, s->config->slots * sizeof(*s->slot_map));
-  for (uint32_t i = 0; i < s->heap_size; i++)
-    slot_map_set(s, entry_hash(&s->heap[i]), i);
-}
-
-/* compute decayed item rate */
-static inline double item_rate(const uss_entry_t *item, uint64_t now_ms,
-                               double half_life_ms) {
-  return decay_since(item->rate, item->last_time_ms, now_ms, half_life_ms);
-}
-
-/* sift up in min-heap */
-static void heapify_up(uss_store_t *topk, uint32_t idx, uint64_t now_ms) {
-  if (!idx)
-    return;
-  double half = topk->config->half_life_ms;
-  uint32_t parent = (idx - 1) / 2;
-  double rate = item_rate(&topk->heap[idx], now_ms, half);
-  if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
-    return;
-  uss_entry_t held;
-  copy_entry(&held, &topk->heap[idx]);
-  size_t held_slot = slot_for_index(topk, idx);
-  uint32_t hole = idx;
-  for (;;) {
-    size_t slot = slot_for_index(topk, parent);
-    copy_entry(&topk->heap[hole], &topk->heap[parent]);
-    slot_index_set(&topk->slot_map[slot], hole);
-    hole = parent;
-    if (!hole)
-      break;
-    parent = (hole - 1) / 2;
-    if (!(rate < item_rate(&topk->heap[parent], now_ms, half)))
-      break;
-  }
-  copy_entry(&topk->heap[hole], &held);
-  slot_index_set(&topk->slot_map[held_slot], hole);
-}
-
-/* sift down in min-heap */
-static void heapify_down(uss_store_t *topk, uint32_t idx, uint64_t now_ms) {
-  uint32_t child = 2 * idx + 1;
-  if (child >= topk->heap_size)
-    return;
-  double half = topk->config->half_life_ms;
-  double held_rate = item_rate(&topk->heap[idx], now_ms, half);
-  double child_rate = item_rate(&topk->heap[child], now_ms, half);
-  if (child + 1 < topk->heap_size) {
-    double right_rate = item_rate(&topk->heap[child + 1], now_ms, half);
-    if (right_rate < child_rate) {
-      child++;
-      child_rate = right_rate;
-    }
-  }
-  if (!(child_rate < held_rate))
-    return;
-  /* carry updated entry through a hole and copy only active pattern bytes */
-  uss_entry_t held;
-  copy_entry(&held, &topk->heap[idx]);
-  size_t held_slot = slot_for_index(topk, idx);
-  uint32_t hole = idx;
-  for (;;) {
-    size_t child_slot = slot_for_index(topk, child);
-    copy_entry(&topk->heap[hole], &topk->heap[child]);
-    slot_index_set(&topk->slot_map[child_slot], hole);
-    hole = child;
-    child = 2 * hole + 1;
-    if (child >= topk->heap_size)
-      break;
-    child_rate = item_rate(&topk->heap[child], now_ms, half);
-    if (child + 1 < topk->heap_size) {
-      double right_rate = item_rate(&topk->heap[child + 1], now_ms, half);
-      if (right_rate < child_rate) {
-        child++;
-        child_rate = right_rate;
-      }
-    }
-    if (!(child_rate < held_rate))
-      break;
-  }
-  copy_entry(&topk->heap[hole], &held);
-  slot_index_set(&topk->slot_map[held_slot], hole);
-}
-
-static bishfpm_store_count_t query_key(const void *raw, uss_key_t key,
+static bishfpm_store_count_t query_key(const void *raw, plugin_key_t key,
                                        size_t length, uint64_t hash,
                                        uint64_t now) {
   const uss_store_t *s = raw;
@@ -378,7 +111,7 @@ static bishfpm_store_count_t query_key(const void *raw, uss_key_t key,
       BISHFPM_UPDATE_ZERO,
       0};
 }
-static bishfpm_store_count_t update_key(void *raw, uss_key_t pattern,
+static bishfpm_store_count_t update_key(void *raw, plugin_key_t pattern,
                                         size_t length, uint64_t hash,
                                         double weight, uint64_t now) {
   uss_store_t *s = raw;
@@ -440,29 +173,8 @@ static bishfpm_store_count_t update_key(void *raw, uss_key_t pattern,
   return r;
 }
 static size_t prune(void *raw, uint64_t now, double cutoff) {
-  uss_store_t *s = raw;
-  double half = s->config->half_life_ms;
   (void)cutoff; /* discarding positive sampled mass would bias estimates */
-  now = effective_time(now, s->max_time_ms);
-  s->total = decay_since(s->total, s->max_time_ms, now, half);
-  s->max_time_ms = now;
-  uint32_t i = 0;
-  size_t removed = 0;
-  while (i < s->heap_size) {
-    if (item_rate(&s->heap[i], now, half) == 0) {
-      --s->heap_size;
-      if (i < s->heap_size)
-        copy_entry(&s->heap[i], &s->heap[s->heap_size]);
-      removed++;
-    } else
-      i++;
-  }
-  if (removed) {
-    slot_map_rebuild(s);
-    for (uint32_t j = s->heap_size / 2; j > 0; j--)
-      heapify_down(s, j - 1, now);
-  }
-  return removed;
+  return heap_prune(raw, now, 0, true);
 }
 static void snapshot(const void *raw, bishfpm_store_snapshot_t *out) {
   const uss_store_t *s = raw;
