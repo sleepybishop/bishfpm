@@ -893,11 +893,11 @@ static bool candidate_promoted(bishfpm_eval_ctx_t *ctx, size_t order,
 }
 
 static void notify_candidate(bishfpm_eval_ctx_t *ctx,
-                             const char *const *subset_items, size_t subset_len,
+                             const char *const *subset_items,
+                             const size_t *item_lengths, size_t subset_len,
                              topk_result_t update, const char *pattern,
-                             uint64_t key, uint64_t hash,
+                             size_t pattern_len, uint64_t key, uint64_t hash,
                              const double *marginals) {
-  char numeric_pattern[BISHFPM_MAX_PATTERN_LEN];
   double p_rate = update.lower;
   double frac = ctx->group_rate > 0.0 ? (p_rate / ctx->group_rate) : 0.0;
 
@@ -921,7 +921,7 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
     return; /* subsumed by active parent pattern */
   }
 
-  /* Numeric callers pass the packed key and defer string serialization. */
+  /* numeric callers pass the packed key and defer string serialization */
   bool numeric = pattern == NULL;
   bool saturated = false;
   const void *identity = numeric ? (const void *)&key : (const void *)pattern;
@@ -934,12 +934,6 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
     return; /* cooldown active */
   }
 
-  if (numeric && ctx->cb) {
-    if (!bishfpm_itemset_serialize(subset_items, subset_len, numeric_pattern,
-                                   sizeof(numeric_pattern)))
-      return;
-    pattern = numeric_pattern;
-  }
   ctx->triggered_count++;
   ctx->engine->stats.triggers_emitted++;
 
@@ -948,9 +942,24 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
       lift =
           compute_subset_lift(subset_len, p_rate, ctx->group_rate, marginals);
     bishfpm_trigger_t trig;
-    memset(&trig, 0, sizeof(trig));
-    snprintf(trig.pattern, sizeof(trig.pattern), "%s", pattern);
-    bishfpm_itemset_format(pattern, trig.formatted, sizeof(trig.formatted));
+    if (numeric) {
+      size_t n0 = item_lengths[0], n1 = item_lengths[1];
+      memcpy(trig.pattern, subset_items[0], n0);
+      trig.pattern[n0] = BISHFPM_ITEM_DELIM;
+      memcpy(trig.pattern + n0 + 1, subset_items[1], n1 + 1);
+      if (n0 + 2 + n1 < sizeof(trig.formatted)) {
+        memcpy(trig.formatted, subset_items[0], n0);
+        trig.formatted[n0] = ',';
+        trig.formatted[n0 + 1] = ' ';
+        memcpy(trig.formatted + n0 + 2, subset_items[1], n1 + 1);
+      } else {
+        bishfpm_itemset_format(trig.pattern, trig.formatted,
+                               sizeof(trig.formatted));
+      }
+    } else {
+      memcpy(trig.pattern, pattern, pattern_len + 1);
+      bishfpm_itemset_format(pattern, trig.formatted, sizeof(trig.formatted));
+    }
     trig.pattern_rate = p_rate;
     trig.pattern_upper_bound = update.upper;
     trig.pattern_error = update.error;
@@ -989,8 +998,8 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
       p->filtered_updates++;
     p->replacements += update.replaced;
     if (candidate_promoted(ctx, depth, update))
-      notify_candidate(ctx, items, depth, update, pattern, 0, update.hash,
-                       marginals);
+      notify_candidate(ctx, items, NULL, depth, update, pattern, length, 0,
+                       update.hash, marginals);
     return;
   }
   size_t needed = target - depth;
@@ -1225,10 +1234,11 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
           if (candidate_promoted(&ctx, 2, update)) {
             const char *pair_items[] = {event->items[i].key,
                                         event->items[j].key};
+            size_t lengths[] = {event->items[i].length, event->items[j].length};
             double marginals[] = {event->items[i].marginal,
                                   event->items[j].marginal};
-            notify_candidate(&ctx, pair_items, 2, update, NULL, key, hash,
-                             marginals);
+            notify_candidate(&ctx, pair_items, lengths, 2, update, NULL, 0, key,
+                             hash, marginals);
           }
         }
     } else {
