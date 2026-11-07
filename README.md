@@ -10,6 +10,43 @@ Memory and per-event work have explicit budgets.
 Counts are approximate. Your application decides what a frequent pattern means
 and whether it warrants action.
 
+## Why bishfpm
+
+Single-attribute counts can miss useful relationships in a stream: requests may
+share a TLS fingerprint and target route while coming from different IPs, or
+failed checkouts may cluster around a device, country, and payment method.
+`bishfpm` surfaces recurring combinations like these as events arrive, within
+configured resource limits.
+
+Unlike offline itemset miners (such as Apriori or FP-Growth) that scan static
+datasets, or stream sketches that count caller-supplied keys but leave candidate
+generation to the application, `bishfpm` handles which combinations to generate,
+how their counts age, and when to notify your application in an embeddable C
+library:
+
+- **Controlled candidate generation.** Items must meet the configured count
+  threshold (and optional share threshold) before contributing to combinations.
+  You choose the combination sizes to track, such as pairs and triples, while a
+  separate per-event work limit rejects events whose worst-case candidate
+  expansion exceeds the budget.
+- **Continuous time decay.** Counts use an exponential half-life in milliseconds,
+  so older events gradually lose weight without a fixed time-window cutoff or
+  reset. Recent activity matters more without retaining raw event history.
+- **Per-group alert rules.** Each tenant, storefront, or other group has its own
+  counts and notification state. Alerts require both a minimum decayed pattern
+  count and a minimum share of the group's decayed event count, with optional
+  lift thresholds, subset suppression, and cooldowns.
+- **Explicit resource limits.** Group, item, and resident-pattern capacities
+  bound retained state, alongside the candidate work limit and library memory
+  budget.
+
+The tradeoff is incomplete pattern history and discovery: gates omit occurrences
+while items are below their thresholds, and bounded stores can miss patterns
+under pressure.
+
+See [`docs/PRIOR_ART.md`](docs/PRIOR_ART.md) for the algorithm lineage and related
+work, and [`docs/DESIGN.md`](docs/DESIGN.md) for counting and resource guarantees.
+
 ## Applications
 
 The frequent-pattern techniques used here have been applied to fraud
