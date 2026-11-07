@@ -69,13 +69,17 @@ static bool configure(const bishfpm_config_t *mining, const void *raw, size_t n,
   const bishfpm_heavykeeper_options_t *o = raw;
   if (!o->capacity || o->capacity > 1000000 || !o->depth || o->depth > 32 ||
       !o->width || o->width > (1U << 24) || !isfinite(o->decay_base) ||
-      o->decay_base <= 0 || o->decay_base == 1 ||
-      !isfinite(mining->ewma_half_life_ms) || mining->ewma_half_life_ms <= 0)
+      o->decay_base <= 0 || !isfinite(mining->ewma_half_life_ms) ||
+      mining->ewma_half_life_ms <= 0)
+    return false;
+  double base = o->decay_base > 1 ? 1 / o->decay_base : o->decay_base;
+  /* bound weighted collision work: at .99 the decrement probability
+   * underflows before a double counter reaches 75000 */
+  if (base > .99)
     return false;
   *c = (hk_config_t){0};
   c->options = *o;
-  if (c->options.decay_base > 1)
-    c->options.decay_base = 1 / c->options.decay_base;
+  c->options.decay_base = base;
   c->half_life_ms = mining->ewma_half_life_ms;
   c->seed = mining->hash_seed;
   c->slots = 16;
@@ -345,8 +349,7 @@ static bool hk_update(hk_store_t *t, const char *pattern, size_t length,
     buckets[row] = hk_bucket(t, pattern, length, row, &fps[row]);
     rates[row] = decay_since(buckets[row]->rate, buckets[row]->time_ms, now,
                              c->half_life_ms);
-    if (rates[row] >= .01 && buckets[row]->fingerprint == fps[row] &&
-        weight > DBL_MAX - rates[row])
+    if (buckets[row]->fingerprint == fps[row] && weight > DBL_MAX - rates[row])
       return false;
   }
   double estimate = 0, base = c->options.decay_base;
@@ -355,11 +358,11 @@ static bool hk_update(hk_store_t *t, const char *pattern, size_t length,
     hk_bucket_t *b = buckets[row];
     b->rate = rates[row];
     b->time_ms = now;
-    if (b->rate < .01) {
+    if (b->fingerprint == fp) {
+      b->rate += weight;
+    } else if (b->rate < .01) {
       b->fingerprint = fp;
       b->rate = weight;
-    } else if (b->fingerprint == fp) {
-      b->rate += weight;
     } else {
       double whole = floor(weight), fraction = weight - whole;
       while (whole >= 1 && b->rate > 0 && b->rate - 1 < b->rate) {

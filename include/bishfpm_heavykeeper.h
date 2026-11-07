@@ -12,7 +12,8 @@ typedef struct {
                         notifications */
   uint32_t depth;    /* 1..32 rows */
   uint32_t width;    /* 1..2^24 cells per row, not necessarily a power of two */
-  double decay_base; /* finite >0, !=1; values >1 are reciprocated */
+  double decay_base; /* finite >0; values >1 are reciprocated; resulting base
+                        must be <=.99 to bound weighted collision work */
 } bishfpm_heavykeeper_options_t;
 void bishfpm_heavykeeper_options_default(bishfpm_heavykeeper_options_t *);
 extern const bishfpm_store_descriptor_t bishfpm_heavykeeper_store;

@@ -98,13 +98,13 @@ static void primitives(void) {
         assert(d->prune(state, 0, 20) == 1);
         r = d->query_text(state, "a\037b", 3, hash, 0);
         assert(!r.resident);
-        close_to(r.upper, 10); /* Empty heap retains sketch history. */
+        close_to(r.upper, 10); /* empty heap retains sketch history */
         r = d->update_text(state, "a\037b", 3, hash, 1, 0);
         assert(r.resident);
         close_to(r.upper, 11);
         r = d->update_text(state, "a\037b", 3, hash, DBL_MAX, 0);
-        /* Rounding DBL_MAX+10 is finite; a second maximum must reject
-         * unchanged. */
+        /* rounding DBL_MAX+10 is finite; a second maximum must reject
+         * unchanged */
         assert(r.outcome == BISHFPM_UPDATE_REJECTED || r.upper == DBL_MAX);
         if (r.upper == DBL_MAX) {
           r = d->update_text(state, "a\037b", 3, hash, DBL_MAX, 0);
@@ -121,13 +121,13 @@ static void primitives(void) {
     }
     assert(l.bytes == 0);
   }
-  /* Large counts beyond 2^53 with decay_base near 1 must not spin in unit
-   * decrement loops when a colliding identity arrives. */
-  bishfpm_heavykeeper_options_t near_one = {1, 1, 1, 1.0 - 1e-16};
+  /* large counts beyond 2^53 must stay safe at the max normalized base on
+   * collision */
+  bishfpm_heavykeeper_options_t limit = {1, 1, 1, .99};
   ledger_t l = {0, 0, -1, 0};
   bishfpm_store_host_t h = {&l, allocate, zeroed, release};
   void *config = NULL, *state = NULL;
-  assert(d->clone_config(&h, &c, &near_one, sizeof(near_one), &config));
+  assert(d->clone_config(&h, &c, &limit, sizeof(limit), &config));
   assert(d->create(&h, config, &state));
   assert(d->update_text(state, "a", 1, 0, 1e16, 0).upper == 1e16);
   assert(d->update_text(state, "b", 1, 0, 1e16, 0).outcome ==
@@ -135,7 +135,16 @@ static void primitives(void) {
   d->destroy(&h, state);
   d->destroy_config(&h, config);
   assert(!l.bytes);
-  for (unsigned bad = 0; bad < 9; bad++) {
+  const double valid_bases[] = {DBL_TRUE_MIN, .95, .99, 1 / .99, DBL_MAX};
+  for (size_t i = 0; i < sizeof(valid_bases) / sizeof(*valid_bases); i++) {
+    bishfpm_heavykeeper_options_t valid = o;
+    valid.decay_base = valid_bases[i];
+    assert(d->plan(&c, &valid, sizeof(valid), &plan));
+    assert(d->clone_config(&h, &c, &valid, sizeof(valid), &config));
+    d->destroy_config(&h, config);
+    assert(!l.bytes);
+  }
+  for (unsigned bad = 0; bad < 13; bad++) {
     bishfpm_heavykeeper_options_t invalid = o;
     switch (bad) {
     case 0:
@@ -165,8 +174,22 @@ static void primitives(void) {
     case 8:
       invalid.decay_base = -.5;
       break;
+    case 9:
+      invalid.decay_base = nextafter(.99, 1);
+      break;
+    case 10:
+      invalid.decay_base = nextafter(1 / .99, 1);
+      break;
+    case 11:
+      invalid.decay_base = 1 - 1e-16;
+      break;
+    case 12:
+      invalid.decay_base = 1 / (1 - 1e-16);
+      break;
     }
     assert(!d->plan(&c, &invalid, sizeof(invalid), &plan));
+    assert(!d->clone_config(&h, &c, &invalid, sizeof(invalid), &config));
+    assert(!l.bytes);
   }
   assert(!d->plan(NULL, &o, sizeof(o), &plan));
   assert(!d->plan(&c, &o, sizeof(o), NULL));
@@ -225,7 +248,7 @@ static void engines(int dynamic) {
   bishfpm_heavykeeper_options_t s = {16, 4, 17, .95};
   bishfpm_t *e = engine(&c, &s, dynamic);
   assert(e);
-  s.capacity = 0; /* Config is owned after construction. */
+  s.capacity = 0; /* config is owned after construction */
   assert(bishfpm_add_event_weighted(e, "g", 0, items, 3, 3, alert, e) == 4);
   close_to(bishfpm_pattern_rate(e, "g", "a\037b", 1000), 1.5);
   close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 3);
@@ -265,6 +288,91 @@ static void engines(int dynamic) {
   assert(bishfpm_add_event(e, "g", 0, items, 2, NULL, NULL) == 1);
   close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0), 2);
   bishfpm_free(e);
+}
+typedef struct {
+  double rate;
+  uint64_t time;
+  unsigned count;
+} small_update_alert_t;
+static void small_update_alert(const char *group, const bishfpm_trigger_t *t,
+                               void *ctx) {
+  small_update_alert_t *expected = ctx;
+  assert(!strcmp(group, "g") && !strcmp(t->pattern, "a\037b"));
+  assert(t->timestamp == expected->time);
+  close_to(t->pattern_rate, expected->rate);
+  expected->count++;
+}
+static void small_matching_updates(int dynamic) {
+  bishfpm_config_t c = mining();
+  c.max_itemset_order = 2;
+  c.min_lift = 0;
+  bishfpm_heavykeeper_options_t s = {1, 1, 1, .95};
+  bishfpm_t *e = engine(&c, &s, dynamic);
+  assert(e);
+  /* advance group watermark with a singleton so each late unit event adds
+   * 1/256 to the pair sketch */
+  assert(bishfpm_add_event(e, "g", 8000, items, 1, NULL, NULL) == 0);
+  small_update_alert_t expected = {0, 8000, 0};
+  for (unsigned i = 1; i <= 1000; i++) {
+    expected.rate = i / 256.0;
+    assert(bishfpm_add_event(e, "g", 0, items, 2, small_update_alert,
+                             &expected) == (i >= 256));
+    close_to(bishfpm_pattern_rate(e, "g", "a\037b", 8000), expected.rate);
+  }
+  assert(expected.count == 745);
+  close_to(bishfpm_group_rate(e, "g", 8000), 1 + 1000 / 256.0);
+  bishfpm_free(e);
+
+  /* matching history survives when decay takes a counter below .01 */
+  e = engine(&c, &s, dynamic);
+  assert(e);
+  expected = (small_update_alert_t){1, 0, 0};
+  assert(bishfpm_add_event(e, "g", 0, items, 2, small_update_alert,
+                           &expected) == 1);
+  assert(bishfpm_add_event(e, "g", 8000, items, 1, NULL, NULL) == 0);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 8000), 1 / 256.0);
+  assert(bishfpm_add_event(e, "g", 0, items, 2, small_update_alert,
+                           &expected) == 0);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 8000), 2 / 256.0);
+  expected.rate = 1 + 2 / 256.0;
+  expected.time = 8000;
+  assert(bishfpm_add_event(e, "g", 8000, items, 2, small_update_alert,
+                           &expected) == 1);
+  close_to(bishfpm_pattern_rate(e, "g", "a\037b", 8000), expected.rate);
+  assert(expected.count == 2);
+  bishfpm_free(e);
+}
+static void large_weight_collisions(int dynamic) {
+  bishfpm_config_t c = mining();
+  c.max_itemset_order = 2;
+  c.min_lift = 0;
+  bishfpm_heavykeeper_options_t s = {1, 1, 1, 1 - 1e-16};
+  /* reject unbounded decay bases in either input convention */
+  assert(!engine(&c, &s, dynamic));
+  s.decay_base = 1 / s.decay_base;
+  assert(!engine(&c, &s, dynamic));
+  const double bases[] = {.99, 1 / .99};
+  const uint32_t weights[] = {UINT32_MAX, 1024};
+  for (size_t i = 0; i < sizeof(bases) / sizeof(*bases); i++) {
+    s.decay_base = bases[i];
+    for (size_t j = 0; j < sizeof(weights) / sizeof(*weights); j++) {
+      bishfpm_t *e = engine(&c, &s, dynamic);
+      assert(e);
+      uint32_t initial = weights[j];
+      assert(bishfpm_add_event_weighted(e, "g", 0, items, 2, initial, NULL,
+                                        NULL) == 1);
+      int replaced = initial == 1024;
+      assert(bishfpm_add_event_weighted(e, "g", 0, items + 1, 2, UINT32_MAX,
+                                        NULL, NULL) == replaced);
+      close_to(bishfpm_pattern_rate(e, "g", "a\037b", 0),
+               replaced ? 0 : initial);
+      double estimate = bishfpm_pattern_rate(e, "g", "b\037c", 0);
+      assert(estimate <= UINT32_MAX &&
+             (replaced ? estimate > 0 : estimate == 0));
+      close_to(bishfpm_group_rate(e, "g", 0), (double)initial + UINT32_MAX);
+      bishfpm_free(e);
+    }
+  }
 }
 static void failures(int dynamic) {
   unsigned constructor_failures = 0, rejected = 0;
@@ -306,6 +414,8 @@ int main(void) {
   identity_collisions();
   for (int dynamic = 0; dynamic < 2; dynamic++) {
     engines(dynamic);
+    small_matching_updates(dynamic);
+    large_weight_collisions(dynamic);
     failures(dynamic);
   }
   bishfpm_config_t c = mining();

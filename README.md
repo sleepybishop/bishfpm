@@ -114,7 +114,10 @@ through the optional descriptor API without changing mining policy.
 The experimental HeavyKeeper plugin retains frequent candidates with probabilistic
 collision handling and wall-clock decay. Selecting its descriptor explicitly opts
 into heuristic alerts: estimates are uncertified, and bounds queries report
-`known=0` with `[0,+infinity]`. See `examples/heavykeeper.c`.
+`known=0` with `[0,+infinity]`. Its `decay_base` must be finite and positive;
+values above 1 are reciprocated, and the resulting base must be at most `0.99`
+to bound weighted collision work. The default is `0.95`.
+See `examples/heavykeeper.c`.
 
 The experimental USS plugin uses randomized weighted Space Saving with EWMA
 decay. It returns zero for nonresident keys and retains positive sampled counters
