@@ -87,6 +87,10 @@ ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors -UNDEBUG \
   -I"$stage/usr/include" -I"$stage" -c "$stage/exact_store.c" -o "$stage/exact_store.o"
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
   -I"$stage/usr/include" -c lib/heavykeeper.c -o "$stage/heavykeeper-backend.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/uss.c -o "$stage/uss-backend.o"
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic-errors \
+  -I"$stage/usr/include" -c lib/uss_pair.c -o "$stage/uss-pair-backend.o"
 version=$(PKG_CONFIG_LIBDIR="$stage/usr/lib/pkgconfig" pkg-config --modversion bishfpm)
 run_compiler() {
   # CC/CXX are shell commands, as in make; keep consumer arguments positional.
@@ -130,6 +134,14 @@ for language in c c++; do
       -I"$stage/usr/include" examples/heavykeeper.c \
       -x none "$library" -lm -o "$stage/heavykeeper"
     LD_LIBRARY_PATH="$stage/usr/lib" "$stage/heavykeeper"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/uss.c \
+      -x none "$library" -lm -o "$stage/uss"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/uss"
+    run_compiler -x "$language" -std="$standard" -Wall -Wextra -pedantic-errors \
+      -I"$stage/usr/include" examples/uss_pair.c \
+      -x none "$library" -lm -o "$stage/uss_pair"
+    LD_LIBRARY_PATH="$stage/usr/lib" "$stage/uss_pair"
   done
 done
 test ! -e "$stage/usr/include/internal.h"

@@ -17,6 +17,8 @@ CORE_OBJ = \
 	lib/store.o \
 	lib/store_plugin.o \
 	lib/heavykeeper.o \
+	lib/uss.o \
+	lib/uss_pair.o \
 	lib/bishfpm.o
 
 TEST_UTILS = \
@@ -40,7 +42,9 @@ TEST_UTILS = \
 	t/00util/test_dynamic \
 	t/00util/test_pressure \
 	t/00util/test_store_plugin \
-	t/00util/test_heavykeeper
+	t/00util/test_heavykeeper \
+	t/00util/test_uss \
+	t/00util/test_uss_pair
 
 BENCH = \
 	t/00util/bench \
@@ -52,7 +56,9 @@ BENCH = \
 EXAMPLES = \
 	examples/stream_tsv \
 	examples/store_plugin \
-	examples/heavykeeper
+	examples/heavykeeper \
+	examples/uss \
+	examples/uss_pair
 
 all: libraries $(TEST_UTILS) $(BENCH) $(EXAMPLES)
 
@@ -83,6 +89,9 @@ t/00util/bench_engines: t/00util/bench_engines.c t/00util/store_twins.c t/00util
 
 t/00util/test_store_plugin: t/00util/test_store_plugin.c examples/exact_store.c examples/exact_store.h libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< examples/exact_store.c libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
+
+t/00util/test_uss: t/00util/test_uss.c libbishfpm.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@
 
 t/00util/test_heavykeeper: t/00util/test_heavykeeper.c libbishfpm.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< libbishfpm.a $(LDFLAGS) -Wl,--wrap=malloc,--wrap=calloc,--wrap=strdup $(LDLIBS) -UNDEBUG -o $@

@@ -13,6 +13,8 @@ build/
 examples/stream_tsv
 examples/store_plugin
 examples/heavykeeper
+examples/uss
+examples/uss_pair
 t/00util/*
 !t/00util/*.c
 !t/00util/*.h

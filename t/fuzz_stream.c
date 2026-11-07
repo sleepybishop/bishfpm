@@ -1,4 +1,5 @@
 #include "bishfpm_heavykeeper.h"
+#include "bishfpm_uss.h"
 #include "examples/exact_store.h"
 #include <assert.h>
 #include <math.h>
@@ -16,7 +17,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (!size)
     return 0;
   unsigned selector = *data++;
-  unsigned store = selector % 8;
+  unsigned store = selector % 9;
   size--;
   bishfpm_config_t c;
   bishfpm_config_default(&c);
@@ -37,7 +38,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     c.max_memory_bytes = 64U << 10;
   }
   bishfpm_t *e;
-  if (store == 7) {
+  if (store == 8) {
+    bishfpm_uss_options_t settings = {8, selector};
+    bishfpm_store_engine_options_t options;
+    bishfpm_store_engine_options_default(&options);
+    options.memory_mode = engine_options.memory_mode;
+    options.notification_capacity = c.topk_k;
+    e = bishfpm_create_with_store(&c, &options, &bishfpm_uss_store, &settings,
+                                  sizeof(settings));
+  } else if (store == 7) {
     bishfpm_heavykeeper_options_t settings = {8, 1, 3, .95};
     bishfpm_store_engine_options_t options;
     bishfpm_store_engine_options_default(&options);
