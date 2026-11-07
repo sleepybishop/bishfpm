@@ -1,6 +1,6 @@
 /* Weighted Unbiased Space Saving, following Ting (SIGMOD 2018), with
  * pairwise unbiased reduction and lazy exponential time decay. Only installed
- * public interfaces are used. See docs/STORES.md#uss for the contract. */
+ * public interfaces are used. */
 #include "bishfpm_hash.h"
 #include "bishfpm_rate.h"
 #include "bishfpm_uss.h"

@@ -9,7 +9,7 @@ extern "C" {
  * sampled counters survive pruning, regardless of the requested cutoff.
  * Alerts use decayed matching updates since admission, excluding inherited
  * mass; query estimates remain heuristic. Whole-group retirement still resets
- * history. See docs/STORES.md#uss. */
+ * history. */
 typedef struct {
   uint32_t
       capacity; /* 1..1000000 resident samples; independent of notifications */

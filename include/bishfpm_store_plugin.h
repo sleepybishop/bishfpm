@@ -11,7 +11,7 @@ extern "C" {
  * only during a call while the engine copies the descriptor and clones config;
  * failed clone/create operations unwind all their own partial allocations;
  * successful create returns a non-NULL state; function code must remain loaded
- * until bishfpm_free; see docs/STORES.md */
+ * until bishfpm_free; see docs/STORE_PLUGINS.md */
 #define BISHFPM_STORE_ABI_V1 1U
 #define BISHFPM_STORE_TEXT 1U
 #define BISHFPM_STORE_PAIR64 2U

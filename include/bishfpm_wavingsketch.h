@@ -10,7 +10,7 @@ extern "C" {
  * Alerts use matching updates since admission, excluding collision history.
  * Evidence has its own timestamp and decays independently of bucket traffic.
  * No unbiasedness guarantee is claimed for this public estimator. Prune clears
- * only entirely zero buckets. See docs/STORES.md#wavingsketch. */
+ * only entirely zero buckets. */
 typedef struct {
   uint32_t buckets;          /* 1..2^24; need not be a power of two */
   uint32_t cells_per_bucket; /* 1..64; product with buckets <=1000000 */

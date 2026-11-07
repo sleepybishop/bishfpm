@@ -108,13 +108,24 @@ resource limits in `docs/DESIGN.md` for details.
 
 Precision, recall, memory use and throughput depend on the store, its
 configuration and the workload. Several stores are available so applications can
-choose suitable accuracy and resource tradeoffs. Developers can also extend the
-library by implementing additional store backends through source changes.
+choose suitable accuracy and resource tradeoffs. Additional backends integrate
+through the optional descriptor API without changing mining policy.
 
-For example, a [HeavyKeeper](https://www.usenix.org/conference/atc18/presentation/gong)
-backend could use compact probabilistic counters to retain frequent patterns amid
-many rare candidates, but its collision handling can underestimate counts, affecting
-recall near alert thresholds.
+The experimental HeavyKeeper plugin retains frequent candidates with probabilistic
+collision handling and wall-clock decay. Selecting its descriptor explicitly opts
+into heuristic alerts: estimates are uncertified, and bounds queries report
+`known=0` with `[0,+infinity]`. See `examples/heavykeeper.c`.
+
+The experimental USS plugin uses randomized weighted Space Saving with EWMA
+decay. It returns zero for nonresident keys and retains positive sampled counters
+during pruning. Selecting it opts into heuristic alerts and unknown bounds.
+Alerts use matching updates since admission, while queries retain the sampled
+estimate. See `examples/uss.c`.
+
+The experimental WavingSketch plugin uses bucket-local heavy cells and signed
+counters, with weighted EWMA updates and heuristic estimates. Alerts require
+matching-update evidence since admission; collision history remains available for
+discovery. See `examples/wavingsketch.c`.
 
 ```mermaid
 flowchart TD
@@ -123,6 +134,9 @@ flowchart TD
 
     G --> SS["Space-Saving<br/>Default store"]
     G --> GFSS["Filtered Space-Saving<br/>Experimental<br/>Bucket history filters admission"]
+    G --> WS["WavingSketch plugin<br/>Experimental<br/>Bucket-local heavy cells"]
+    G --> USS["USS plugin<br/>Experimental<br/>Randomized weighted estimates"]
+    G --> HK["HeavyKeeper plugin<br/>Experimental<br/>Uncertified estimates"]
 
     P --> NSS["Numeric Space-Saving<br/>Recommended baseline"]
     P --> TH["Threshold<br/>Count intervals<br/>Rejects events when saturated"]
@@ -138,6 +152,9 @@ flowchart TD
 | `BISHFPM_PAIR_SS` | Pair-only streaming; the recommended starting point |
 | `BISHFPM_PAIR_THRESHOLD` | Explicit forgetting bounds and rejection when capacity is exhausted |
 | `BISHFPM_PAIR_FSS` | Experimental filtering under candidate pressure |
+| `bishfpm_heavykeeper_store` via `bishfpm_create_with_store` | Experimental text HeavyKeeper; explicitly heuristic alerts and estimates |
+| `bishfpm_uss_store` via `bishfpm_create_with_store` | Experimental weighted Unbiased Space Saving; explicitly heuristic alerts and estimates |
+| `bishfpm_wavingsketch_store` via `bishfpm_create_with_store` | Experimental weighted EWMA WavingSketch; explicitly heuristic alerts and estimates |
 | `bishfpm_pair_counter_new` | Exact counts over a fixed vocabulary, without decay or alerts |
 
 General stores use `topk_k` for resident pattern capacity. With
@@ -228,9 +245,18 @@ in this release.
 Count recovery and notification delivery are separate measures. These checks
 do not establish fraud or anomaly detection accuracy.
 
+## Custom pattern stores
+
+`bishfpm_store_plugin.h` provides an opt-in, versioned descriptor API through
+`bishfpm_create_with_store`. A backend can use canonical text itemsets or packed
+numeric pairs, typed owned configuration, whole-event reservation, certified
+bounds, and host-budgeted allocation. Existing constructors retain direct built-in
+updates. See `docs/STORE_PLUGINS.md` and `examples/store_plugin.c`.
+
 ## Further reading
 
 - `docs/DESIGN.md`: time, counts, callbacks, limits, and experimental options.
+- `docs/STORE_PLUGINS.md`: writing a custom pattern store plugin.
 - `docs/PRIOR_ART.md`: inherited techniques and comparison scope.
 - `bishfpm_lowlevel.h`: counters, stores, rates, and arenas.
 
