@@ -1,6 +1,7 @@
 #include "bishfpm.h"
 #include "internal.h"
 #include "store_plugin.h"
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +82,8 @@ typedef struct {
   bishfpm_memory_budget_t *budget;
   uint64_t hash;
   bishfpm_rate_t group_rate;
+  /* Upper bound on a pattern's mass omitted by gates or rejected updates. */
+  bishfpm_rate_t quality_omitted;
   bishfpm_rate_table_t *item_rates;
   store_t store;
   void *cooldowns;
@@ -116,6 +119,8 @@ struct bishfpm {
   size_t group_count;
   prepared_event_t workspace;
   bishfpm_stats_t stats;
+  double min_partition_lift;
+  bishfpm_alert_quality_stats_t alert_quality;
   bishfpm_pattern_pressure_t pressure; /* Counters from removed groups only. */
   uint64_t rejected[REJECT_REASON_COUNT];
   bool busy;
@@ -139,6 +144,20 @@ static bishfpm_memory_budget_t *engine_budget(bishfpm_t *e) {
 void bishfpm_options_default(bishfpm_options_t *o) {
   if (o)
     *o = (bishfpm_options_t){BISHFPM_STORE_SS, 0, BISHFPM_MEMORY_CONSERVATIVE};
+}
+
+int bishfpm_set_min_partition_lift(bishfpm_t *engine, double threshold) {
+  if (!engine || engine->busy || engine->stats.events_accepted ||
+      !isfinite(threshold) || threshold < 0.0)
+    return 0;
+  engine->min_partition_lift = threshold;
+  return 1;
+}
+
+void bishfpm_get_alert_quality_stats(const bishfpm_t *engine,
+                                     bishfpm_alert_quality_stats_t *out) {
+  if (engine && out)
+    *out = engine->alert_quality;
 }
 
 /* default config initialization */
@@ -885,9 +904,102 @@ typedef struct {
   void *udata;
   int triggered_count;
   bool require_resident;
+  bool quality_omitted_event;
   bishfpm_store_count_t (*update_text)(void *, const char *, size_t, uint64_t,
                                        double, uint64_t);
 } bishfpm_eval_ctx_t;
+
+/* A canonical pattern occurs at most once per event. Charge the whole event
+ * once even if several gates/updates omit it. Infinity disables evidence for
+ * this group if the bound itself can no longer be represented. */
+static void record_quality_omission(bishfpm_group_t *grp, uint64_t now,
+                                    double half_life, double weight) {
+  if (weight > 0 && isfinite(grp->quality_omitted.rate) &&
+      !(bishfpm_rate_update_weighted(&grp->quality_omitted, now, half_life,
+                                     weight) > 0))
+    grp->quality_omitted.rate = INFINITY;
+}
+
+static bool partition_lift_suppressed(bishfpm_eval_ctx_t *ctx,
+                                       const char *const *items, size_t order,
+                                       const char *pattern,
+                                       const double *marginals) {
+  bishfpm_t *engine = ctx->engine;
+  double threshold = engine->min_partition_lift;
+  bishfpm_alert_quality_stats_t *stats = &engine->alert_quality;
+  stats->candidates_checked++;
+  bishfpm_group_t *grp = ctx->grp;
+  store_result_t candidate = grp->store.config->ops->query_text(
+      &grp->store, pattern, ctx->timestamp_ms);
+  double group = ctx->group_rate;
+  if (!candidate.known || !isfinite(candidate.count.upper) ||
+      candidate.count.upper < 0 || !isfinite(group) || group <= 0 ||
+      !isfinite(grp->quality_omitted.rate)) {
+    stats->candidates_unknown++;
+    return false;
+  }
+  double omitted = bishfpm_rate_query(&grp->quality_omitted, ctx->timestamp_ms,
+                                      engine->cfg.ewma_half_life_ms);
+  if (!isfinite(omitted) || omitted < 0) {
+    stats->candidates_unknown++;
+    return false;
+  }
+  /* Certified store bounds cover evaluated history. Gates and rejected
+   * updates can omit occurrences; add their bound without overflowing. */
+  double upper = candidate.count.upper;
+  upper = upper >= group || omitted >= group - upper ? group : upper + omitted;
+
+  unsigned full = (1U << order) - 1;
+  double lower[16] = {0};
+  for (unsigned mask = 1; mask < full; mask++) {
+    size_t count = 0, length = 0;
+    char subset[BISHFPM_MAX_PATTERN_LEN];
+    for (size_t i = 0; i < order; i++) {
+      if (!(mask & (1U << i)))
+        continue;
+      if (count++)
+        subset[length++] = BISHFPM_ITEM_DELIM;
+      size_t n = strlen(items[i]);
+      memcpy(subset + length, items[i], n);
+      length += n;
+      lower[mask] = marginals[i];
+    }
+    if (count == 1)
+      continue;
+    lower[mask] = 0;
+    if (count < engine->cfg.min_itemset_order ||
+        count > engine->cfg.max_itemset_order)
+      continue;
+    subset[length] = 0;
+    store_result_t r = grp->store.config->ops->query_text(
+        &grp->store, subset, ctx->timestamp_ms);
+    if (r.known)
+      lower[mask] = r.count.lower;
+  }
+  bool unknown = false;
+  /* Fix one item on the left to visit each unordered split exactly once. */
+  for (unsigned mask = 1; mask < full; mask += 2) {
+    double parts[] = {lower[mask], lower[full ^ mask]};
+    if (!isfinite(parts[0]) || parts[0] <= 0 || !isfinite(parts[1]) ||
+        parts[1] <= 0) {
+      unknown = true;
+      continue;
+    }
+    double score = upper > 0 ? compute_subset_lift(2, upper, group, parts) : 0;
+    /* Keep equality and near-boundary floating-point results eligible. */
+    score = nextafter(score, INFINITY);
+    if (score < threshold &&
+        threshold - score > 64 * DBL_EPSILON * threshold) {
+      stats->candidates_suppressed++;
+      return true;
+    }
+    if (isnan(score))
+      unknown = true;
+  }
+  if (unknown)
+    stats->candidates_unknown++;
+  return false;
+}
 
 static bool candidate_promoted(bishfpm_eval_ctx_t *ctx, size_t order,
                                topk_result_t update) {
@@ -919,6 +1031,14 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
       ctx->engine->stats.triggers_suppressed++;
       return; /* lack of positive statistical correlation */
     }
+  }
+
+  if (ctx->engine->min_partition_lift > 0 && subset_len >= 3 &&
+      subset_len <= 4 &&
+      partition_lift_suppressed(ctx, subset_items, subset_len, pattern,
+                                marginals)) {
+    ctx->engine->stats.triggers_suppressed++;
+    return;
   }
 
   /* check subsumption by active subset alerts */
@@ -1017,6 +1137,12 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
       else
         p->filtered_updates++;
       p->replacements += update.replaced;
+    }
+    if (ctx->engine->min_partition_lift > 0 && depth >= 3 && depth <= 4 &&
+        ctx->weight > 0 && !update.accepted && !ctx->quality_omitted_event) {
+      record_quality_omission(ctx->grp, ctx->timestamp_ms,
+                               ctx->engine->cfg.ewma_half_life_ms, ctx->weight);
+      ctx->quality_omitted_event = true;
     }
     if (candidate_promoted(ctx, depth, update))
       notify_candidate(ctx, items, NULL, depth, update, pattern, length, 0,
@@ -1243,6 +1369,9 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
   engine->stats.events_accepted++;
   double group_rate = bishfpm_rate_update_weighted(
       &grp->group_rate, now, engine->cfg.ewma_half_life_ms, effective_weight);
+  if (engine->min_partition_lift > 0 && effective_weight > 0 &&
+      !(group_rate > 0))
+    grp->quality_omitted.rate = INFINITY;
   size_t elevated = 0;
   for (size_t i = 0; i < event->count; i++) {
     prepared_item_t *item = &event->items[i];
@@ -1260,6 +1389,14 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     }
   }
 
+  bool quality_omitted_event =
+      engine->min_partition_lift > 0 && effective_weight > 0 &&
+      engine->cfg.max_itemset_order >= 3 &&
+      engine->cfg.min_itemset_order <= 4 && event->count >= 3 &&
+      event->count >= engine->cfg.min_itemset_order && elevated < event->count;
+  if (quality_omitted_event)
+    record_quality_omission(grp, now, engine->cfg.ewma_half_life_ms,
+                             effective_weight);
   event->count = elevated;
   result = 0;
   if (elevated >= engine->cfg.min_itemset_order) {
@@ -1278,6 +1415,7 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
         0,
         engine->numeric_pairs || engine->store_config.sketch_width ||
             engine->store_config.extension,
+        quality_omitted_event,
         engine->store_config.extension
             ? ((store_extension_t *)engine->store_config.extension)
                   ->descriptor.update_text

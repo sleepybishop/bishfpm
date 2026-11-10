@@ -494,8 +494,183 @@ static void evidence_policy(void) {
     bishfpm_free(e);
   }
 }
+
+/* Preserve exact estimates but deliberately expose no certified count bounds. */
+static bishfpm_store_count_t unknown_partition_update(
+    void *state, const char *key, size_t n, uint64_t hash, double weight,
+    uint64_t now) {
+  bishfpm_store_count_t r =
+      exact_text_store.update_text(state, key, n, hash, weight, now);
+  r.lower = 0;
+  r.known = 0;
+  return r;
+}
+static bishfpm_store_count_t unknown_partition_query(
+    const void *state, const char *key, size_t n, uint64_t hash, uint64_t now) {
+  bishfpm_store_count_t r =
+      exact_text_store.query_text(state, key, n, hash, now);
+  r.lower = 0;
+  r.known = 0;
+  return r;
+}
+static bool reject_partition_triple;
+static bishfpm_store_count_t rejecting_partition_update(
+    void *state, const char *key, size_t n, uint64_t hash, double weight,
+    uint64_t now) {
+  if (reject_partition_triple && weight > 0 && n == 5 &&
+      !memcmp(key, "a\037b\037c", n)) {
+    /* Inject a guarded-update failure without rejecting the whole event. */
+    bishfpm_store_count_t r =
+        exact_text_store.query_text(state, key, n, hash, now);
+    r.outcome = BISHFPM_UPDATE_REJECTED;
+    return r;
+  }
+  return exact_text_store.update_text(state, key, n, hash, weight, now);
+}
+static void partition_triple_alert(const char *group,
+                                   const bishfpm_trigger_t *t, void *ctx) {
+  assert(!strcmp(group, "g"));
+  if (t->item_count == 3) {
+    (*(unsigned *)ctx)++;
+    assert(!strcmp(t->pattern, "a\037b\037c"));
+    /* Full-history uncertainty is private to the notification filter. */
+    close_to(t->pattern_rate, 1);
+    close_to(t->pattern_upper_bound, 1);
+    close_to(t->pattern_error, 0);
+  }
+}
+static bishfpm_store_count_t widen_partition_count(bishfpm_store_count_t r,
+                                                   size_t length) {
+  if (r.resident) {
+    if (length == 5)
+      r.lower = fmin(r.lower, .25);
+    else if (length == 3)
+      r.upper *= 10;
+  }
+  return r;
+}
+static bishfpm_store_count_t interval_partition_update(
+    void *state, const char *key, size_t n, uint64_t hash, double weight,
+    uint64_t now) {
+  return widen_partition_count(
+      exact_text_store.update_text(state, key, n, hash, weight, now), n);
+}
+static bishfpm_store_count_t interval_partition_query(
+    const void *state, const char *key, size_t n, uint64_t hash, uint64_t now) {
+  return widen_partition_count(
+      exact_text_store.query_text(state, key, n, hash, now), n);
+}
+static void interval_triple_alert(const char *group,
+                                   const bishfpm_trigger_t *t, void *ctx) {
+  assert(!strcmp(group, "g"));
+  if (t->item_count == 3) {
+    (*(unsigned *)ctx)++;
+    assert(!strcmp(t->pattern, "a\037b\037c"));
+    close_to(t->pattern_rate, .25);
+    close_to(t->pattern_upper_bound, 2);
+    close_to(t->pattern_error, 1.75);
+  }
+}
+static void partition_plugin_policy(int dynamic) {
+  bishfpm_config_t c = mining();
+  c.min_lift = c.subsumption_ratio = 0;
+  exact_store_options_t raw = {4, BISHFPM_STORE_TEXT, "partition evidence"};
+  bishfpm_store_descriptor_t d = exact_text_store;
+  d.capabilities = BISHFPM_STORE_HEURISTIC_ESTIMATES;
+  d.update_text = unknown_partition_update;
+  d.query_text = unknown_partition_query;
+  bishfpm_t *e = create_with_options(&d, &c, &raw, sizeof(raw), dynamic);
+  assert(e && bishfpm_set_min_partition_lift(e, 1.1));
+  /* Every partition has actual lift 1, but the heuristic descriptor supplies
+   * no proof. Both candidate and subset estimates must remain pass-through. */
+  assert(bishfpm_add_event_weighted(e, "g", 0, abc, 3, 3, heuristic_alert,
+                                   e) == 4);
+  assert(bishfpm_add_event(e, "g", 1000, abc, 3, heuristic_alert, e) == 4);
+  bishfpm_alert_quality_stats_t quality;
+  bishfpm_get_alert_quality_stats(e, &quality);
+  assert(quality.candidates_checked == 2 &&
+         quality.candidates_unknown == 2 && !quality.candidates_suppressed);
+  accounting(e);
+  bishfpm_free(e);
+
+  d = exact_text_store;
+  d.update_text = rejecting_partition_update;
+  e = create_with_options(&d, &c, &raw, sizeof(raw), dynamic);
+  assert(e && bishfpm_set_min_partition_lift(e, 1.5));
+  reject_partition_triple = true;
+  assert(bishfpm_add_event_weighted(e, "g", 0, abc, 3, 8, NULL, NULL) == 3);
+  const char *background[] = {"d"};
+  assert(bishfpm_add_event_weighted(e, "g", 0, background, 1, 8, NULL,
+                                   NULL) == 0);
+  reject_partition_triple = false;
+  unsigned triples = 0;
+  /* At one half-life, true ABC support is 5 and G is 9: all partition lifts
+   * are 1.8. The store retained only 1, which would give a false lift of .36
+   * without adding the rejected event's decayed omitted mass to the upper. */
+  assert(bishfpm_add_event(e, "g", 1000, abc, 3, partition_triple_alert,
+                           &triples) == 4);
+  assert(triples == 1);
+  check_count(e, "a\037b", 1000, 5);
+  check_count(e, "a\037b\037c", 1000, 1);
+  close_to(bishfpm_group_rate(e, "g", 1000), 9);
+  bishfpm_get_alert_quality_stats(e, &quality);
+  assert(quality.candidates_checked == 1 && !quality.candidates_suppressed);
+  accounting(e);
+  bishfpm_free(e);
+
+  e = create_with_options(&d, &c, &raw, sizeof(raw), dynamic);
+  assert(e && bishfpm_set_min_partition_lift(e, 1.5));
+  assert(bishfpm_add_event(e, "g", 0, abc, 3, NULL, NULL) == 3);
+  assert(bishfpm_add_event_weighted(e, "g", 0, background, 1, 9, NULL,
+                                   NULL) == 0);
+  reject_partition_triple = true;
+  triples = 0;
+  /* A rejected resident update still returns its old eligible count. Its
+   * omitted weight must be recorded before this notification: true lift is
+   * 9 * 18 / (9 * 9) = 2, but the stale upper alone gives only 2/9. */
+  assert(bishfpm_add_event_weighted(e, "g", 0, abc, 3, 8,
+                                   partition_triple_alert, &triples) == 4);
+  reject_partition_triple = false;
+  assert(triples == 1);
+  check_count(e, "a\037b", 0, 9);
+  check_count(e, "a\037b\037c", 0, 1);
+  close_to(bishfpm_group_rate(e, "g", 0), 18);
+  bishfpm_get_alert_quality_stats(e, &quality);
+  assert(quality.candidates_checked == 2 &&
+         quality.candidates_suppressed == 1 && !quality.candidates_unknown);
+  accounting(e);
+  bishfpm_free(e);
+
+  d = exact_text_store;
+  d.update_text = interval_partition_update;
+  d.query_text = interval_partition_query;
+  c.min_pattern_rate = .25;
+  e = create_with_options(&d, &c, &raw, sizeof(raw), dynamic);
+  assert(e && bishfpm_set_min_partition_lift(e, 2));
+  assert(bishfpm_add_event(e, "g", 0, abc, 3, NULL, NULL) == 3);
+  for (size_t i = 0; i < 3; i++)
+    assert(bishfpm_add_event_weighted(e, "g", 0, &abc[i], 1, 18, NULL,
+                                     NULL) == 0);
+  assert(bishfpm_add_event_weighted(e, "g", 0, background, 1, 44, NULL,
+                                   NULL) == 0);
+  triples = 0;
+  /* C_ABC is in [.25, 2], each pair in [2, 20], each singleton is 20,
+   * and G=100. The conservative split upper is 5; using the candidate lower
+   * or pair upper would falsely suppress this at threshold 2. */
+  assert(bishfpm_add_event(e, "g", 0, abc, 3, interval_triple_alert,
+                           &triples) == 4);
+  assert(triples == 1);
+  close_to(bishfpm_group_rate(e, "g", 0), 100);
+  bishfpm_get_alert_quality_stats(e, &quality);
+  assert(quality.candidates_checked == 2 &&
+         quality.candidates_suppressed == 1 && !quality.candidates_unknown);
+  accounting(e);
+  bishfpm_free(e);
+}
 int main(void) {
   evidence_policy();
+  for (int dynamic = 0; dynamic < 2; dynamic++)
+    partition_plugin_policy(dynamic);
   descriptors();
   budget_caps();
   for (unsigned rep = BISHFPM_STORE_TEXT; rep <= BISHFPM_STORE_PAIR64; rep++)

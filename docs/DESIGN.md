@@ -14,7 +14,7 @@ flowchart TD
     C --> D["Commit group and item counts at the group clock"]
     D --> E["Select items passing count/share gates"]
     E --> F["Generate and update a candidate"]
-    F --> G["Check promotion, lift, subset suppression, and cooldown"]
+    F --> G["Check promotion, lift, optional partition lift, subset suppression, and cooldown"]
     G --> H["Deliver callback if eligible"]
     H --> I{"More candidates?"}
     I -->|Yes| F
@@ -260,14 +260,16 @@ below. Queries and the passage of time alone do not produce notifications.
 A promoted candidate still passes through optional suppression checks:
 
 1. **Lift:** require sufficient concentration relative to the item marginals.
-2. **Subset suppression:** when `subsumption_ratio > 0`, suppress a candidate if
+2. **Partition lift:** when enabled, suppress triples or quadruples only when
+   count bounds prove a split's lift is below the configured threshold.
+3. **Subset suppression:** when `subsumption_ratio > 0`, suppress a candidate if
    a resident proper subset has a positive lower count `P` and
    `L < subsumption_ratio * P`, provided that subset's prior notification decision
    is still within `trigger_cooldown_ms`. A prior decision counts even when no
    callback was supplied. Missing subsets supply no evidence; pair-only engines
    have no smaller tracked patterns. This reduces overlap without producing
    closed or maximal itemsets.
-3. **Cooldown:** suppress repeats until the configured duration has elapsed.
+4. **Cooldown:** suppress repeats until the configured duration has elapsed.
 
 Cooldown protection is independent of store residency. When notification storage
 is full, active protection is retained and new alerts are suppressed. Candidate
@@ -282,6 +284,67 @@ check.
 Ingestion returns `-1` on rejection. Otherwise, it returns the number of eligible
 alert decisions, even if no callback was supplied. Counting a decision and
 delivering a callback are distinct operations.
+
+### Optional partition lift filter
+
+Call `bishfpm_set_min_partition_lift(engine, threshold)` before the first accepted
+event. It returns `1` on success and `0` for a null or busy engine, accepted data,
+or a negative/nonfinite threshold. Zero disables the filter and is the default.
+This additive API leaves config and trigger layouts unchanged, including the
+existing meaning of callback `lift`.
+
+Only triples and quadruples are examined: three and seven unique two-part splits,
+respectively. Other orders keep their existing behavior. For candidate `X` and
+split `P | Q`, define the full-history split lift as
+`C_X * G / (C_P * C_Q)`. The filter uses an upper bound `U_X` for the candidate
+and lower bounds `L_P`, `L_Q` for the two parts:
+
+```text
+split_lift_upper = U_X * G / (L_P * L_Q)
+```
+
+It suppresses only when this upper score is below the threshold, allowing a small
+rounding guard. Singleton parts use observed marginal counts as lower bounds;
+larger parts require certified store lower bounds for configured subset orders.
+For example, configure orders 2 through 4 to make pair and triple evidence
+available for quadruples. Missing or uncertified evidence and zero lower counts
+cannot establish suppression. Another split with sufficient evidence can still
+suppress the candidate. Marginal forgetting or uncertain retention weakens this
+test rather than supplying evidence of redundancy.
+
+Store bounds alone cover evaluated candidates, so the filter separately accounts
+for omitted occurrences. While enabled, each group retains one decayed omitted-
+mass counter `B`. An accepted event capable of producing a configured triple or
+quadruple contributes its effective weight to `B` if any item is gated, or a
+triple/quadruple update is rejected. It contributes at most once, even when both
+conditions occur or many candidates are omitted. Canonicalization gives each
+pattern at most one contribution per event, so `B` bounds that pattern's missing
+mass. Given a certified evaluated-history candidate upper bound `U_eval`:
+
+```text
+U_X = min(G, U_eval + B)
+```
+
+`B` uses the same effective time and late-discounted weight as the other counts.
+It survives pruning within a group and resets with a new group lifetime. This
+adds constant-size group state without retaining transactions. Gated unrelated
+items can make `B` loose and leave more alerts unsuppressed. The public
+`bishfpm_pattern_bounds` API continues to report evaluated-history bounds; this
+full-history adjustment is internal to the filter.
+
+With tight bounds, `AB=320`, `C=900`, `ABC=288`, and `G=1000` give split lift
+`288 * 1000 / (320 * 900) = 1` for `AB | C`; threshold `1.1` suppresses the
+triple. Uncertainty can prevent that decision. This is a descriptive filter,
+not a statistical significance test, and pass-through is not a guarantee that
+every split exceeds the threshold.
+
+Checks run after count/share and existing `min_lift` eligibility, before subset
+suppression and cooldown, without changing count updates. A quadruple requires
+at most eleven pattern queries: the candidate and its ten proper subsets of
+size two or three. `bishfpm_get_alert_quality_stats` returns cumulative
+`candidates_checked`, `candidates_suppressed`, and `candidates_unknown` separately
+from existing statistics. Unknown counts pass-through decisions with unavailable
+evidence; snapshots do not reset counters.
 
 ## Pruning and group lifetime
 

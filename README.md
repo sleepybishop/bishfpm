@@ -141,6 +141,38 @@ change.
 See the configuration fields in `bishfpm.h` and
 resource limits in `docs/DESIGN.md` for details.
 
+### Optional partition lift filter
+
+To reduce triples and quadruples whose association is explained by a simpler
+split, enable the filter immediately after creating the engine, before its first
+accepted event:
+
+```c
+if (!bishfpm_set_min_partition_lift(engine, 1.1)) {
+    bishfpm_free(engine);
+    return 1;
+}
+```
+
+The threshold must be finite and nonnegative; `0` leaves the filter disabled
+(the default). The setter returns `0` for invalid or busy engines, or engines
+that have already accepted an event.
+Pairs and orders above four keep their existing behavior.
+
+For example, with decayed counts `AB=320`, `C=900`, `ABC=288`, and group count
+`G=1000`, the `AB | C` split has lift `288 * 1000 / (320 * 900) = 1`.
+Sufficiently tight count bounds let a threshold of `1.1` suppress that triple.
+The filter checks three splits for triples and seven for quadruples, after
+count/share and existing lift eligibility, before subset suppression and cooldown.
+
+Only a proven below-threshold split suppresses an alert. Unknown bounds or zero
+subset lower counts provide no suppression evidence, so passing this filter does
+not guarantee a minimum partition lift or statistical significance. Configure
+the subset orders you want it to examine, usually pairs through triples or
+quadruples. `bishfpm_get_alert_quality_stats` reports separate checked, suppressed,
+and unknown counts. Counting and the existing config/trigger layouts stay
+unchanged; see [the bound and its limitations](docs/DESIGN.md#optional-partition-lift-filter).
+
 ## Choosing a store
 
 Precision, recall, memory use and throughput depend on the store, its
