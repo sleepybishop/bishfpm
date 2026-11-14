@@ -28,8 +28,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   c.max_event_items = 8;
   c.max_candidates_per_event = 128;
   c.item_rate_threshold = c.min_pattern_rate = c.promotion_fraction = 0;
+  if ((selector & 16) && store != 3)
+    c.item_rate_threshold = c.min_pattern_rate = 2;
   c.min_itemset_order = 1;
-  c.max_itemset_order = 3;
+  c.max_itemset_order = (selector & 32) ? 4 : 3;
   c.trigger_cooldown_ms = 10;
   c.subsumption_ratio = .8;
   bishfpm_options_t engine_options;
@@ -91,6 +93,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   }
   if (!e)
     return 0;
+  if (selector & 32)
+    assert(bishfpm_set_min_partition_lift(e, (selector & 16) ? 1.5 : 0.5));
+  if (selector & 64)
+    assert(bishfpm_set_conservative_subsumption(e, 1));
   int heuristic = store >= 7;
   uint64_t t = 0;
   while (size >= 4) {
@@ -139,6 +145,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                reasons.group_limit + reasons.marginal_limit +
                reasons.allocation_failure + reasons.reentrant ==
            st.events_rejected);
+    bishfpm_partition_lift_stats_t pl;
+    bishfpm_get_partition_lift_stats(e, &pl);
+    assert(pl.candidates_suppressed + pl.candidates_unknown <=
+           pl.candidates_checked);
+    assert(pl.candidates_checked <= st.candidates_evaluated);
   }
   bishfpm_free(e);
   return 0;

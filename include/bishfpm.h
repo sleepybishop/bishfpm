@@ -152,27 +152,28 @@ bishfpm_t *bishfpm_create_with_options(const bishfpm_config_t *,
  * failure. Existing constructors use conservative memory mode.
  * bishfpm_create(NULL) uses defaults. */
 bishfpm_t *bishfpm_create(const bishfpm_config_t *cfg);
-/* Optional notification filter for triples and quadruples. Zero (the default)
- * disables it. A positive finite threshold suppresses only when certified
- * count bounds prove that some two-part partition has lift below it.
- * Uncertain evidence passes through; pairs and orders above four are unchanged.
- * Call before the first accepted event. Returns 1 on success, or 0 for NULL,
- * negative/nonfinite thresholds, reentrancy, or an engine that has accepted data.
- * Counting, candidate admission, existing config/trigger layouts and lift are
- * unchanged. This descriptive filter is not a statistical significance test. */
+/* optional partition-lift filter for text triples and quadruples. 0 disables
+ * it; positive finite thresholds suppress only when certified bounds prove some
+ * two-part split has lift below threshold (up to a small rounding guard).
+ * call before the first accepted event; returns 1 on success or 0 on error. */
 int bishfpm_set_min_partition_lift(bishfpm_t *, double threshold);
+
+/* optional conservative subset suppression for text engines. when enabled (1),
+ * active subset cooldowns suppress only when a certified candidate upper bound
+ * (including omitted history) is below subsumption_ratio * subset lower bound.
+ * call before the first accepted event; returns 1 on success or 0 on error. */
+int bishfpm_set_conservative_subsumption(bishfpm_t *, int enabled);
 
 typedef struct {
   uint64_t candidates_checked;
   uint64_t candidates_suppressed;
   uint64_t candidates_unknown;
-} bishfpm_alert_quality_stats_t;
-/* Cumulative filter decisions after count/share and existing lift eligibility.
- * Unknown counts pass-through decisions with unavailable partition evidence.
- * A checked candidate is not necessarily proven productive. NULL arguments
- * leave output unchanged; snapshots do not reset counters. */
-void bishfpm_get_alert_quality_stats(const bishfpm_t *,
-                                     bishfpm_alert_quality_stats_t *);
+} bishfpm_partition_lift_stats_t;
+/* cumulative partition-lift filter decisions; unknown counts pass-throughs with
+ * unavailable evidence. NULL args are ignored; snapshots do not reset counters.
+ */
+void bishfpm_get_partition_lift_stats(const bishfpm_t *,
+                                      bishfpm_partition_lift_stats_t *);
 
 /* Opt-in numeric pair backends; cfg must have min/max itemset order 2.
  * IDs persist for a group's lifetime: marginal keys are retained across prune.

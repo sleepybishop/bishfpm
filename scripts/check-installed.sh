@@ -18,13 +18,15 @@ int main(void) {
   bishfpm_t *engine = bishfpm_create(&cfg);
   if (!engine) return 1;
   if (!bishfpm_set_min_partition_lift(engine, 1.1)) return 17;
-  bishfpm_alert_quality_stats_t quality;
-  bishfpm_get_alert_quality_stats(engine, &quality);
+  if (!bishfpm_set_conservative_subsumption(engine, 1)) return 20;
+  bishfpm_partition_lift_stats_t quality;
+  bishfpm_get_partition_lift_stats(engine, &quality);
   if (quality.candidates_checked || quality.candidates_suppressed ||
       quality.candidates_unknown) return 18;
   const char *items[] = {"a", "b"};
   int result = bishfpm_add_event(engine, "g", 0, items, 2, NULL, NULL);
   if (bishfpm_set_min_partition_lift(engine, 0)) return 19;
+  if (bishfpm_set_conservative_subsumption(engine, 0)) return 21;
   bishfpm_rejection_stats_t reasons;
   int rejected = bishfpm_add_event(engine, NULL, 0, items, 2, NULL, NULL);
   bishfpm_get_rejection_stats(engine, &reasons);

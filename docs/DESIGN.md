@@ -263,12 +263,13 @@ A promoted candidate still passes through optional suppression checks:
 2. **Partition lift:** when enabled, suppress triples or quadruples only when
    count bounds prove a split's lift is below the configured threshold.
 3. **Subset suppression:** when `subsumption_ratio > 0`, suppress a candidate if
-   a resident proper subset has a positive lower count `P` and
+   a proper subset has a positive maintained count `P` and, by default,
    `L < subsumption_ratio * P`, provided that subset's prior notification decision
-   is still within `trigger_cooldown_ms`. A prior decision counts even when no
-   callback was supplied. Missing subsets supply no evidence; pair-only engines
-   have no smaller tracked patterns. This reduces overlap without producing
-   closed or maximal itemsets.
+   is still within `trigger_cooldown_ms`. The opt-in conservative mode instead
+   requires a full-history candidate upper bound and a certified parent lower
+   bound. A prior decision counts even when no callback was supplied. Numeric
+   pair engines have no subset suppression. This reduces overlap without
+   producing closed or maximal itemsets.
 4. **Cooldown:** suppress repeats until the configured duration has elapsed.
 
 Cooldown protection is independent of store residency. When notification storage
@@ -313,13 +314,16 @@ suppress the candidate. Marginal forgetting or uncertain retention weakens this
 test rather than supplying evidence of redundancy.
 
 Store bounds alone cover evaluated candidates, so the filter separately accounts
-for omitted occurrences. While enabled, each group retains one decayed omitted-
-mass counter `B`. An accepted event capable of producing a configured triple or
-quadruple contributes its effective weight to `B` if any item is gated, or a
-triple/quadruple update is rejected. It contributes at most once, even when both
-conditions occur or many candidates are omitted. Canonicalization gives each
-pattern at most one contribution per event, so `B` bounds that pattern's missing
-mass. Given a certified evaluated-history candidate upper bound `U_eval`:
+for omitted occurrences using one decayed group counter `B`, shared with
+[conservative subset suppression](#conservative-subset-suppression) when enabled.
+The affected orders are triples/quadruples for partition lift and configured text
+orders above `min_itemset_order` for conservative subsumption. An accepted event
+capable of producing an affected candidate contributes its effective weight to
+`B` if any item is gated, or an affected candidate update is rejected. It
+contributes at most once, even when both conditions occur or many candidates are
+omitted. Canonicalization gives each pattern at most one contribution per event,
+so `B` bounds that pattern's missing mass. Given a certified evaluated-history
+candidate upper bound `U_eval`:
 
 ```text
 U_X = min(G, U_eval + B)
@@ -328,9 +332,11 @@ U_X = min(G, U_eval + B)
 `B` uses the same effective time and late-discounted weight as the other counts.
 It survives pruning within a group and resets with a new group lifetime. This
 adds constant-size group state without retaining transactions. Gated unrelated
-items can make `B` loose and leave more alerts unsuppressed. The public
-`bishfpm_pattern_bounds` API continues to report evaluated-history bounds; this
-full-history adjustment is internal to the filter.
+items can make `B` loose and leave more alerts unsuppressed. Enabling both modes
+can broaden the events counted in `B` and weaken partition suppression; this
+remains conservative. The public `bishfpm_pattern_bounds` API continues to report
+evaluated-history bounds; this full-history adjustment is internal to the two
+suppression policies.
 
 With tight bounds, `AB=320`, `C=900`, `ABC=288`, and `G=1000` give split lift
 `288 * 1000 / (320 * 900) = 1` for `AB | C`; threshold `1.1` suppresses the
@@ -339,12 +345,48 @@ not a statistical significance test, and pass-through is not a guarantee that
 every split exceeds the threshold.
 
 Checks run after count/share and existing `min_lift` eligibility, before subset
-suppression and cooldown, without changing count updates. A quadruple requires
-at most eleven pattern queries: the candidate and its ten proper subsets of
-size two or three. `bishfpm_get_alert_quality_stats` returns cumulative
-`candidates_checked`, `candidates_suppressed`, and `candidates_unknown` separately
-from existing statistics. Unknown counts pass-through decisions with unavailable
-evidence; snapshots do not reset counters.
+suppression and cooldown, without changing count updates. The partition filter
+queries at most ten proper subsets of size two or three per quadruple (reusing
+the updated upper bound on resident built-in candidates and querying the
+candidate once on store extensions), stopping as soon as any split proves
+suppression. `bishfpm_get_partition_lift_stats` returns cumulative
+`candidates_checked`, `candidates_suppressed`, and `candidates_unknown`
+separately from existing statistics. Unknown counts pass-through decisions with
+unavailable evidence; snapshots do not reset counters.
+
+### Conservative subset suppression
+
+`bishfpm_set_conservative_subsumption(engine, enabled)` selects the subset policy
+before the first accepted event. Only `0` and `1` are valid; zero is the default
+and preserves the existing comparison of maintained candidate and parent counts.
+The setter returns `1` on success, or `0` for invalid arguments, a busy engine,
+or an engine that has accepted data. Config and trigger layouts are unchanged.
+
+Conservative mode still requires a proper subset with a notification decision
+inside the current `trigger_cooldown_ms` window. It queries that parent's
+certified lower bound `L_P` and the candidate's full-history upper bound `U_X`,
+including the shared omitted mass described above. Suppression requires
+
+```text
+U_X < subsumption_ratio * L_P
+```
+
+with a small rounding guard. Since `C_X <= U_X` and `L_P <= C_P`, this establishes
+the same inequality for the true decayed counts, subject to floating-point
+rounding. A low candidate lower bound alone cannot establish it. Missing,
+uncertified, nonfinite, or nonpositive parent evidence supplies no proof; another
+active proper subset may still prove suppression. An unavailable candidate upper
+bound passes through. Passing this check does not guarantee that a candidate is
+more informative than its subsets.
+
+The existing `subsumption_ratio` and cooldown controls remain in force; zero for
+either disables subset suppression. Conservative mode covers configured text
+orders above `min_itemset_order`, including pairs when the minimum order is one
+and orders above four. Singleton parents use certified store counts and must
+have an active notification just like larger parents. Numeric pair engines
+remain excluded. The existing bounded notification table and shared group bound
+suffice; no transaction history or unbounded state is added. Counting, callback
+`lift`, and public evaluated-history bounds retain their existing meanings.
 
 ## Pruning and group lifetime
 

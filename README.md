@@ -141,37 +141,43 @@ change.
 See the configuration fields in `bishfpm.h` and
 resource limits in `docs/DESIGN.md` for details.
 
-### Optional partition lift filter
+### Optional partition lift and conservative subset suppression
 
-To reduce triples and quadruples whose association is explained by a simpler
-split, enable the filter immediately after creating the engine, before its first
-accepted event:
+Two opt-in notification filters tighten suppression on text engines using
+certified count bounds, configured after creation and before the first accepted
+event:
 
 ```c
-if (!bishfpm_set_min_partition_lift(engine, 1.1)) {
+if (!bishfpm_set_min_partition_lift(engine, 1.1) ||
+    !bishfpm_set_conservative_subsumption(engine, 1)) {
     bishfpm_free(engine);
     return 1;
 }
 ```
 
-The threshold must be finite and nonnegative; `0` leaves the filter disabled
-(the default). The setter returns `0` for invalid or busy engines, or engines
-that have already accepted an event.
-Pairs and orders above four keep their existing behavior.
+- **Partition lift (`bishfpm_set_min_partition_lift`):** examines three two-part
+  splits for triples and seven for quadruples (leaving other orders unchanged);
+  `0` disables it. For example, with `AB=320`, `C=900`, `ABC=288`, and `G=1000`,
+  the `AB | C` split has lift `288 * 1000 / (320 * 900) = 1`, so threshold `1.1`
+  suppresses the triple when count bounds are tight. Configure the subset orders
+  needed to certify splits (typically pairs through triples or quadruples).
+  `bishfpm_get_partition_lift_stats` reports cumulative `candidates_checked`,
+  `candidates_suppressed`, and `candidates_unknown` pass-through counts.
+- **Conservative subset suppression (`bishfpm_set_conservative_subsumption`):**
+  accepts `0` (default) or `1`, using `subsumption_ratio` and active
+  `trigger_cooldown_ms` windows across text orders above `min_itemset_order`
+  (both must be positive to suppress). Instead of comparing lower counts, it
+  suppresses only when the candidate's full-history upper bound is below
+  `subsumption_ratio * parent_lower` for a certified parent lower bound.
 
-For example, with decayed counts `AB=320`, `C=900`, `ABC=288`, and group count
-`G=1000`, the `AB | C` split has lift `288 * 1000 / (320 * 900) = 1`.
-Sufficiently tight count bounds let a threshold of `1.1` suppress that triple.
-The filter checks three splits for triples and seven for quadruples, after
-count/share and existing lift eligibility, before subset suppression and cooldown.
-
-Only a proven below-threshold split suppresses an alert. Unknown bounds or zero
-subset lower counts provide no suppression evidence, so passing this filter does
-not guarantee a minimum partition lift or statistical significance. Configure
-the subset orders you want it to examine, usually pairs through triples or
-quadruples. `bishfpm_get_alert_quality_stats` reports separate checked, suppressed,
-and unknown counts. Counting and the existing config/trigger layouts stay
-unchanged; see [the bound and its limitations](docs/DESIGN.md#optional-partition-lift-filter).
+Both filters suppress only on certified proof (with a small floating-point
+rounding guard); uncertain or missing bounds pass through. To cover history
+omitted by marginal gates or rejected store updates without retaining
+transactions, each group maintains one decayed omitted-mass bound. Events that
+carry infrequent attributes gated by `item_rate_threshold` (default `5.0`) or
+`item_share_threshold` add to this bound and weaken suppression until those
+items warm up or the gates are lowered. See [Optional partition lift filter](docs/DESIGN.md#optional-partition-lift-filter)
+and [Conservative subset suppression](docs/DESIGN.md#conservative-subset-suppression).
 
 ## Choosing a store
 

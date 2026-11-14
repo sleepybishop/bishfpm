@@ -17,8 +17,8 @@ static void on_test_trigger(const char *group_key,
   if (alert_count < MAX_ALERTS) {
     snprintf(alert_patterns[alert_count], sizeof(alert_patterns[alert_count]),
              "%s", trigger->formatted);
-    snprintf(alert_keys[alert_count], sizeof(alert_keys[alert_count]),
-             "%s", trigger->pattern);
+    snprintf(alert_keys[alert_count], sizeof(alert_keys[alert_count]), "%s",
+             trigger->pattern);
     alert_lifts[alert_count] = trigger->lift;
   }
   alert_count++;
@@ -51,7 +51,7 @@ static bishfpm_config_t partition_config(void) {
 }
 
 static bishfpm_t *partition_engine(const bishfpm_config_t *cfg,
-                                    double threshold, int fss) {
+                                   double threshold, int fss) {
   bishfpm_options_t options;
   bishfpm_options_default(&options);
   if (fss) {
@@ -67,29 +67,31 @@ static bishfpm_t *partition_engine(const bishfpm_config_t *cfg,
 
 static void feed(bishfpm_t *engine, const char *const *items, size_t n,
                  uint32_t weight) {
-  assert(bishfpm_add_event_weighted(engine, "g", 1000, items, n, weight,
-                                    NULL, NULL) >= 0);
+  assert(bishfpm_add_event_weighted(engine, "g", 1000, items, n, weight, NULL,
+                                    NULL) >= 0);
 }
 
 static void finish_fixture(bishfpm_t *engine, const char *const *items,
-                            size_t n, bishfpm_alert_quality_stats_t *delta) {
-  bishfpm_alert_quality_stats_t before, after;
-  bishfpm_get_alert_quality_stats(engine, &before);
+                           size_t n, bishfpm_partition_lift_stats_t *delta) {
+  bishfpm_partition_lift_stats_t before, after;
+  bishfpm_get_partition_lift_stats(engine, &before);
   alert_count = 0;
   assert(bishfpm_add_event_weighted(engine, "g", 1000, items, n, 1,
                                     on_test_trigger, NULL) >= 0);
-  bishfpm_get_alert_quality_stats(engine, &after);
+  bishfpm_get_partition_lift_stats(engine, &after);
   if (delta) {
-    delta->candidates_checked = after.candidates_checked - before.candidates_checked;
+    delta->candidates_checked =
+        after.candidates_checked - before.candidates_checked;
     delta->candidates_suppressed =
         after.candidates_suppressed - before.candidates_suppressed;
-    delta->candidates_unknown = after.candidates_unknown - before.candidates_unknown;
+    delta->candidates_unknown =
+        after.candidates_unknown - before.candidates_unknown;
   }
 }
 
 static bishfpm_t *triple_fixture(double threshold, int productive,
                                  int only_triples, int fss,
-                                 bishfpm_alert_quality_stats_t *delta) {
+                                 bishfpm_partition_lift_stats_t *delta) {
   bishfpm_config_t cfg = partition_config();
   if (only_triples)
     cfg.min_itemset_order = 3;
@@ -124,11 +126,10 @@ static void assert_exact_pattern(bishfpm_t *engine, const char *pattern,
 }
 
 static void test_partition_lift_independent_item(void) {
-  /* A=B=400, C=900, AB=320, ABC=288, G=1000. Singleton lift is
-   * 2 and ABC/AB is .9, so existing lift/subsumption allow the triple.
-   * C is independent of AB: the AB|C partition has lift exactly 1. */
+  /* a=b=400, c=900, AB=320, ABC=288, G=1000: singleton lift is 2 and
+   * ABC/AB is .9, while AB|c has lift 1 */
   for (int fss = 0; fss <= 1; fss++) {
-    bishfpm_alert_quality_stats_t delta;
+    bishfpm_partition_lift_stats_t delta;
     bishfpm_t *baseline = triple_fixture(-1.0, 0, 0, fss, &delta);
     assert(alert_count == 1 && alerts_for("a\037b\037c") == 1);
     assert(fabs(alert_lifts[0] - 2.0) < 1e-10);
@@ -140,7 +141,7 @@ static void test_partition_lift_independent_item(void) {
     assert(delta.candidates_checked == 1 && delta.candidates_suppressed == 1);
     assert(delta.candidates_unknown == 0);
 
-    /* Notification selection must leave every support count unchanged. */
+    /* notification selection leaves every support count unchanged */
     const char *patterns[] = {"a\037b", "a\037c", "b\037c", "a\037b\037c"};
     const double counts[] = {320, 360, 360, 288};
     for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
@@ -170,9 +171,9 @@ static void test_partition_lift_independent_item(void) {
 
 static void test_partition_lift_productive_and_unknown(void) {
   for (int fss = 0; fss <= 1; fss++) {
-    bishfpm_alert_quality_stats_t delta;
-    /* A=B=C=400, each pair=320, ABC=288, G=1000: all three
-     * partitions have lift 2.25, including at the threshold boundary. */
+    bishfpm_partition_lift_stats_t delta;
+    /* a=b=c=400, each pair=320, ABC=288, G=1000: all three splits have lift
+     * 2.25, including at the threshold boundary */
     bishfpm_t *engine = triple_fixture(2.25, 1, 0, fss, &delta);
     assert(alert_count == 1 && alerts_for("a\037b\037c") == 1);
     assert(fabs(alert_lifts[0] - 4.5) < 1e-10);
@@ -180,8 +181,7 @@ static void test_partition_lift_productive_and_unknown(void) {
     assert(delta.candidates_unknown == 0);
     bishfpm_free(engine);
 
-    /* An order-three-only engine has no pair history to certify a split.
-     * Even the redundant fixture must pass through with unknown evidence. */
+    /* triple-only engine lacks pair history and passes with unknown evidence */
     engine = triple_fixture(1.1, 0, 1, fss, &delta);
     assert(alerts_for("a\037b\037c") == 1);
     assert(delta.candidates_checked == 1 && delta.candidates_suppressed == 0);
@@ -208,12 +208,12 @@ static void test_partition_lift_api(void) {
   assert(!bishfpm_set_min_partition_lift(engine, 0.0));
   assert(!bishfpm_set_min_partition_lift(engine, 2.0));
 
-  bishfpm_alert_quality_stats_t stats = {7, 8, 9};
-  bishfpm_get_alert_quality_stats(NULL, &stats);
+  bishfpm_partition_lift_stats_t stats = {7, 8, 9};
+  bishfpm_get_partition_lift_stats(NULL, &stats);
   assert(stats.candidates_checked == 7 && stats.candidates_suppressed == 8 &&
          stats.candidates_unknown == 9);
-  bishfpm_get_alert_quality_stats(engine, NULL);
-  bishfpm_get_alert_quality_stats(engine, &stats);
+  bishfpm_get_partition_lift_stats(engine, NULL);
+  bishfpm_get_partition_lift_stats(engine, &stats);
   assert(stats.candidates_checked == 0 && stats.candidates_suppressed == 0 &&
          stats.candidates_unknown == 0);
   bishfpm_free(engine);
@@ -232,8 +232,7 @@ static void test_partition_lift_quads(void) {
       cfg.promotion_fraction = 0.10;
       cfg.subsumption_ratio = 0.0;
       bishfpm_t *engine = partition_engine(&cfg, enabled ? 1.1 : 0.0, fss);
-      /* Two independent correlated blocks: all 1+3 partition lifts are
-       * 2.5, but AB|CD has lift 1. Checking only singletons misses this. */
+      /* two independent correlated blocks: 1+3 lifts are 2.5, AB|CD is 1 */
       feed(engine, ab, 2, 240);
       feed(engine, cd, 2, 240);
       feed(engine, bg, 1, 360);
@@ -247,8 +246,7 @@ static void test_partition_lift_quads(void) {
     bishfpm_config_t cfg = partition_config();
     cfg.max_itemset_order = 4;
     bishfpm_t *engine = partition_engine(&cfg, 2.5, fss);
-    /* Marginals=400 and all proper multi-item counts=288. Every split
-     * has lift at least 2.5, so a productive quad survives. */
+    /* marginals=400 and proper subsets=288: every split has lift >= 2.5 */
     for (size_t i = 0; i < 4; i++)
       feed(engine, &abcd[i], 1, 112);
     feed(engine, bg, 1, 264);
@@ -257,8 +255,7 @@ static void test_partition_lift_quads(void) {
     assert(alerts_for("a\037b\037c\037d") == 1);
     bishfpm_free(engine);
 
-    /* Missing pair history must not hide a proven 1+3 split. Here
-     * ABC=400, D=900, ABCD=360, G=1000, so ABC|D has lift 1. */
+    /* missing pair history does not hide proven 1+3 split ABC|d with lift 1 */
     cfg.min_itemset_order = 3;
     cfg.min_pattern_rate = 360;
     cfg.subsumption_ratio = 0.0;
@@ -267,7 +264,7 @@ static void test_partition_lift_quads(void) {
     feed(engine, &abcd[3], 1, 540);
     feed(engine, bg, 1, 60);
     feed(engine, abcd, 4, 359);
-    bishfpm_alert_quality_stats_t delta;
+    bishfpm_partition_lift_stats_t delta;
     finish_fixture(engine, abcd, 4, &delta);
     assert(alerts_for("a\037b\037c\037d") == 0);
     assert(delta.candidates_suppressed >= 1);
@@ -292,9 +289,8 @@ static void test_partition_lift_gated_history(void) {
       feed(engine, abc, 3, 1);
     feed(engine, bg, 1, 300);
     finish_fixture(engine, abc, 3, NULL);
-    /* Full support is ABC=200, AB=300, C=200, G=600: minimum lift 2.
-     * Gating leaves evaluated ABC=101 and AB=201; mixing those counts
-     * with full marginals gives 1.507 and would incorrectly suppress. */
+    /* full support ABC=200, AB=300, c=200, G=600 has min lift 2; mixing gated
+     * ABC=101 and AB=201 with full marginals would falsely give 1.507 */
     assert(alerts_for("a\037b\037c") == 1);
     assert(bishfpm_group_rate(engine, "g", 1000) == 600);
     assert(bishfpm_item_rate(engine, "g", "c", 1000) == 200);
@@ -313,13 +309,161 @@ static void test_partition_lift_unchanged_orders(void) {
     cfg.min_pattern_rate = 1;
     cfg.promotion_fraction = cfg.min_lift = cfg.subsumption_ratio = 0.0;
     bishfpm_t *engine = partition_engine(&cfg, 100.0, 0);
-    bishfpm_alert_quality_stats_t delta;
+    bishfpm_partition_lift_stats_t delta;
     finish_fixture(engine, items, orders[i], &delta);
     assert(alert_count == 1);
     assert(delta.candidates_checked == 0 && delta.candidates_suppressed == 0 &&
            delta.candidates_unknown == 0);
     bishfpm_free(engine);
   }
+}
+
+static void conservative_fixture(unsigned order, int crowded, int gated,
+                                 int enabled, double ratio, int fss,
+                                 int expected_alerts) {
+  bishfpm_config_t cfg = partition_config();
+  cfg.min_itemset_order = order > 4 ? order - 1 : (order == 2 ? 1 : 2);
+  cfg.max_itemset_order = order;
+  cfg.item_rate_threshold = gated ? 100 : 0;
+  cfg.min_pattern_rate = gated ? 101 : 100;
+  cfg.min_lift = cfg.promotion_fraction = 0;
+  cfg.subsumption_ratio = ratio;
+  cfg.topk_k = 128;
+  cfg.max_items_per_group = 64;
+  bishfpm_t *engine = partition_engine(&cfg, 0.0, fss);
+  if (enabled >= 0)
+    assert(bishfpm_set_conservative_subsumption(engine, enabled));
+
+  /* exceed proper_subset_probes so crowded=1 exercises mask probes */
+  if (crowded) {
+    unsigned count = order == 2 ? 3 : (order == 3 ? 4 : (order == 4 ? 11 : 6));
+    unsigned width = cfg.min_itemset_order;
+    for (unsigned i = 0; i < count; i++) {
+      char noise_names[4][24];
+      const char *noise[4];
+      for (unsigned j = 0; j < width; j++) {
+        snprintf(noise_names[j], sizeof(noise_names[j]), "noise-%u-%02u", j, i);
+        noise[j] = noise_names[j];
+      }
+      feed(engine, noise, width, 101);
+    }
+  }
+
+  char names[BISHFPM_MAX_ITEMSET_ORDER][16];
+  const char *items[BISHFPM_MAX_ITEMSET_ORDER];
+  char candidate[BISHFPM_MAX_PATTERN_LEN], parent[BISHFPM_MAX_PATTERN_LEN];
+  size_t length = 0;
+  for (unsigned i = 0; i < order; i++) {
+    snprintf(names[i], sizeof(names[i]), "item%02u", i);
+    items[i] = names[i];
+    if (i)
+      candidate[length++] = '\037';
+    size_t n = strlen(items[i]);
+    memcpy(candidate + length, items[i], n + 1);
+    length += n;
+    if (i == order - 2)
+      memcpy(parent, candidate, length + 1);
+  }
+  if (gated) {
+    /* full support is 200/300 (> .6); gated evaluated counts 101/201 (< .6)
+     * must not suppress when omitted history is included */
+    for (int i = 0; i < 100; i++)
+      feed(engine, items, order - 1, 1);
+    for (int i = 0; i < 199; i++)
+      feed(engine, items, order, 1);
+  } else {
+    /* exact support 100/200: ratio .6 suppresses, equality at .5 passes */
+    feed(engine, items, order - 1, 100);
+    feed(engine, items, order, 99);
+  }
+  bishfpm_partition_lift_stats_t partition_delta;
+  finish_fixture(engine, items, order, &partition_delta);
+  assert(alerts_for(candidate) == expected_alerts);
+  assert_exact_pattern(engine, candidate, gated ? 101 : 100);
+  assert_exact_pattern(engine, parent, gated ? 201 : 200);
+  assert(partition_delta.candidates_checked == 0);
+  bishfpm_free(engine);
+}
+
+static void test_conservative_subsumption(void) {
+  const unsigned orders[] = {2, 3, 4, 5, BISHFPM_MAX_ITEMSET_ORDER};
+  for (int fss = 0; fss <= 1; fss++) {
+    for (size_t i = 0; i < sizeof(orders) / sizeof(orders[0]); i++) {
+      unsigned order = orders[i];
+      int paths = order <= 5 ? 2 : 1;
+      for (int crowded = 0; crowded < paths; crowded++) {
+        conservative_fixture(order, crowded, 1, -1, 0.6, fss, 0);
+        conservative_fixture(order, crowded, 1, 0, 0.6, fss, 0);
+        conservative_fixture(order, crowded, 1, 1, 0.6, fss, 1);
+        conservative_fixture(order, crowded, 0, 1, 0.6, fss, 0);
+        conservative_fixture(order, crowded, 0, 1, 0.5, fss, 1);
+        /* rounding guard keeps a single ulp above .5 eligible */
+        conservative_fixture(order, crowded, 0, 1, nextafter(0.5, 1.0), fss, 1);
+      }
+    }
+  }
+}
+
+static void test_conservative_subsumption_disabled_config(void) {
+  const char *ab[] = {"a", "b"};
+  const char *abc[] = {"a", "b", "c"};
+  for (int fss = 0; fss <= 1; fss++) {
+    for (int no_cooldown = 0; no_cooldown <= 1; no_cooldown++) {
+      bishfpm_config_t cfg = partition_config();
+      cfg.min_pattern_rate = 1;
+      cfg.min_lift = cfg.promotion_fraction = 0;
+      cfg.subsumption_ratio = no_cooldown ? 0.6 : 0.0;
+      cfg.trigger_cooldown_ms = no_cooldown ? 0 : 10000;
+      bishfpm_t *engine = partition_engine(&cfg, 0.0, fss);
+      assert(bishfpm_set_conservative_subsumption(engine, 1));
+      feed(engine, ab, 2, 100);
+      finish_fixture(engine, abc, 3, NULL);
+      assert(alerts_for("a\037b\037c") == 1);
+      bishfpm_free(engine);
+    }
+  }
+}
+
+typedef struct {
+  bishfpm_t *engine;
+  unsigned calls;
+} conservative_callback_t;
+
+static void on_conservative_setter_trigger(const char *group_key,
+                                           const bishfpm_trigger_t *trigger,
+                                           void *udata) {
+  (void)group_key;
+  (void)trigger;
+  conservative_callback_t *ctx = udata;
+  assert(!bishfpm_set_conservative_subsumption(ctx->engine, 0));
+  assert(!bishfpm_set_conservative_subsumption(ctx->engine, 1));
+  ctx->calls++;
+}
+
+static void test_conservative_subsumption_api(void) {
+  bishfpm_config_t cfg = partition_config();
+  cfg.min_lift = cfg.promotion_fraction = 0;
+  cfg.min_pattern_rate = 1;
+  bishfpm_t *engine = bishfpm_create(&cfg);
+  assert(engine);
+  assert(!bishfpm_set_conservative_subsumption(NULL, 1));
+  assert(!bishfpm_set_conservative_subsumption(engine, -1));
+  assert(!bishfpm_set_conservative_subsumption(engine, 2));
+  assert(bishfpm_set_conservative_subsumption(engine, 1));
+  assert(bishfpm_set_conservative_subsumption(engine, 0));
+
+  const char *ab[] = {"a", "b"};
+  feed(engine, ab, 2, 0);
+  assert(bishfpm_add_event(engine, "g", 1000, NULL, 0, NULL, NULL) == 0);
+  assert(bishfpm_add_event(engine, "", 1000, ab, 2, NULL, NULL) == -1);
+  assert(bishfpm_set_conservative_subsumption(engine, 1));
+  conservative_callback_t ctx = {engine, 0};
+  assert(bishfpm_add_event(engine, "g", 1000, ab, 2,
+                           on_conservative_setter_trigger, &ctx) == 1);
+  assert(ctx.calls == 1);
+  assert(!bishfpm_set_conservative_subsumption(engine, 0));
+  assert(!bishfpm_set_conservative_subsumption(engine, 1));
+  bishfpm_free(engine);
 }
 
 int main(void) {
@@ -330,6 +474,10 @@ int main(void) {
   test_partition_lift_gated_history();
   test_partition_lift_unchanged_orders();
   printf("PASS: partition lift alert quality tests passed\n");
+  test_conservative_subsumption();
+  test_conservative_subsumption_disabled_config();
+  test_conservative_subsumption_api();
+  printf("PASS: conservative subsumption tests passed\n");
   /* test 1: verify lift calculation and filtering */
   {
     bishfpm_config_t cfg;

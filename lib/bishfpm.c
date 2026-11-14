@@ -82,7 +82,7 @@ typedef struct {
   bishfpm_memory_budget_t *budget;
   uint64_t hash;
   bishfpm_rate_t group_rate;
-  /* Upper bound on a pattern's mass omitted by gates or rejected updates. */
+  /* upper bound on pattern mass omitted by gates or rejected updates */
   bishfpm_rate_t quality_omitted;
   bishfpm_rate_table_t *item_rates;
   store_t store;
@@ -120,7 +120,9 @@ struct bishfpm {
   prepared_event_t workspace;
   bishfpm_stats_t stats;
   double min_partition_lift;
-  bishfpm_alert_quality_stats_t alert_quality;
+  bool conservative_subsumption;
+  uint32_t quality_min_order, quality_max_order;
+  bishfpm_partition_lift_stats_t partition_lift_stats;
   bishfpm_pattern_pressure_t pressure; /* Counters from removed groups only. */
   uint64_t rejected[REJECT_REASON_COUNT];
   bool busy;
@@ -146,18 +148,58 @@ void bishfpm_options_default(bishfpm_options_t *o) {
     *o = (bishfpm_options_t){BISHFPM_STORE_SS, 0, BISHFPM_MEMORY_CONSERVATIVE};
 }
 
+static bool conservative_subsumption_enabled(const bishfpm_t *engine) {
+  return engine->conservative_subsumption && !engine->numeric_pairs &&
+         engine->cfg.subsumption_ratio > 0 &&
+         engine->cfg.trigger_cooldown_ms > 0 &&
+         engine->cfg.max_itemset_order > engine->cfg.min_itemset_order;
+}
+
+/* tracked omission orders always form one contiguous interval */
+static void refresh_quality_orders(bishfpm_t *e) {
+  uint32_t lo = UINT32_MAX, hi = 0;
+  uint32_t min_k = e->cfg.min_itemset_order, max_k = e->cfg.max_itemset_order;
+  if (!e->numeric_pairs && e->min_partition_lift > 0) {
+    uint32_t plo = min_k > 3 ? min_k : 3;
+    uint32_t phi = max_k < 4 ? max_k : 4;
+    if (plo <= phi) {
+      lo = plo;
+      hi = phi;
+    }
+  }
+  if (conservative_subsumption_enabled(e)) {
+    uint32_t slo = min_k + 1;
+    if (slo < lo)
+      lo = slo;
+    if (max_k > hi)
+      hi = max_k;
+  }
+  e->quality_min_order = lo;
+  e->quality_max_order = hi;
+}
+
 int bishfpm_set_min_partition_lift(bishfpm_t *engine, double threshold) {
   if (!engine || engine->busy || engine->stats.events_accepted ||
       !isfinite(threshold) || threshold < 0.0)
     return 0;
   engine->min_partition_lift = threshold;
+  refresh_quality_orders(engine);
   return 1;
 }
 
-void bishfpm_get_alert_quality_stats(const bishfpm_t *engine,
-                                     bishfpm_alert_quality_stats_t *out) {
+int bishfpm_set_conservative_subsumption(bishfpm_t *engine, int enabled) {
+  if (!engine || engine->busy || engine->stats.events_accepted ||
+      (enabled != 0 && enabled != 1))
+    return 0;
+  engine->conservative_subsumption = enabled != 0;
+  refresh_quality_orders(engine);
+  return 1;
+}
+
+void bishfpm_get_partition_lift_stats(const bishfpm_t *engine,
+                                      bishfpm_partition_lift_stats_t *out) {
   if (engine && out)
-    *out = engine->alert_quality;
+    *out = engine->partition_lift_stats;
 }
 
 /* default config initialization */
@@ -338,6 +380,7 @@ static bishfpm_t *create_internal(const bishfpm_config_t *cfg,
 
   engine->cfg = c;
   engine->options = o;
+  engine->quality_min_order = UINT32_MAX;
   engine->memory.limit = c.max_memory_bytes;
   engine->memory.current = engine->memory.peak = sizeof(*engine);
   engine->numeric_pairs = selected.ops->pairs;
@@ -785,30 +828,63 @@ static bool is_pattern_subset(const char *sub_pattern,
   return false;
 }
 
-/* check if candidate is subsumed by an active subset trigger */
-static inline double store_query_lower(const bishfpm_group_t *g,
-                                       const char *key, uint64_t now) {
-  return g->store.config->ops->query_text(&g->store, key, now).count.lower;
+/* keep equality and near-boundary floating-point results eligible */
+static bool conservatively_below(double upper, double threshold) {
+  upper = nextafter(upper, INFINITY);
+  return upper < threshold && threshold - upper > 64 * DBL_EPSILON * threshold;
 }
+
+static bool subset_suppresses(const bishfpm_group_t *grp, const char *pattern,
+                              uint64_t now, double candidate_rate, double ratio,
+                              bool conservative) {
+  store_result_t parent =
+      grp->store.config->ops->query_text(&grp->store, pattern, now);
+  double lower = parent.count.lower;
+  if (!conservative)
+    return lower > 0 && candidate_rate < ratio * lower;
+  return parent.known && isfinite(lower) && lower > 0 &&
+         conservatively_below(candidate_rate, ratio * lower);
+}
+
+static size_t proper_subset_probes(size_t n, size_t min_order) {
+  if (n > 8)
+    return SIZE_MAX;
+  size_t binom = 1, excluded = 1;
+  for (size_t k = 1; k < min_order; k++) {
+    binom = binom * (n - k + 1) / k;
+    excluded += binom;
+  }
+  return ((size_t)1 << n) - 1 - excluded;
+}
+
+/* conservative mode passes a certified full-history upper bound; legacy mode
+ * compares lower counts */
 static bool is_candidate_subsumed(bishfpm_group_t *grp,
                                   const char *const *subset_items,
-                                  size_t subset_len, double candidate_rate,
-                                  uint64_t now_ms, uint64_t cooldown_ms,
+                                  const size_t *item_lengths, size_t subset_len,
+                                  double candidate_rate, uint64_t now_ms,
+                                  uint64_t cooldown_ms,
                                   double subsumption_ratio, size_t min_order,
-                                  uint64_t hash_seed) {
+                                  uint64_t hash_seed, bool conservative) {
   if (store_is_pairs(&grp->store) || subsumption_ratio <= 0.0 || !cooldown_ms ||
       !grp->cooldowns || !grp->cooldown_count || subset_len <= min_order) {
     return false;
   }
-  if ((subset_len == 3 || subset_len == 4) && min_order == 2 &&
-      grp->cooldown_count > (subset_len == 3 ? 3u : 10u)) {
-    size_t lengths[4];
-    for (size_t i = 0; i < subset_len; i++)
-      lengths[i] = strlen(subset_items[i]);
+  size_t k_min = min_order ? min_order : 1;
+  if (grp->cooldown_count > proper_subset_probes(subset_len, k_min)) {
+    size_t local_lengths[8];
+    if (!item_lengths) {
+      for (size_t i = 0; i < subset_len; i++)
+        local_lengths[i] = strlen(subset_items[i]);
+      item_lengths = local_lengths;
+    }
     char sub[BISHFPM_MAX_PATTERN_LEN];
     unsigned limit = (1u << subset_len) - 1;
-    for (unsigned mask = 3; mask < limit; mask++) {
-      if (!(mask & (mask - 1)))
+    for (unsigned mask = (1u << k_min) - 1; mask < limit; mask++) {
+      size_t bits = 0;
+      for (unsigned m = mask; m; m &= m - 1)
+        bits++;
+      if (bits < k_min)
         continue;
       size_t length = 0;
       for (size_t i = 0; i < subset_len; i++) {
@@ -816,8 +892,8 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
           continue;
         if (length)
           sub[length++] = BISHFPM_ITEM_DELIM;
-        memcpy(sub + length, subset_items[i], lengths[i]);
-        length += lengths[i];
+        memcpy(sub + length, subset_items[i], item_lengths[i]);
+        length += item_lengths[i];
       }
       sub[length] = '\0';
       uint64_t hash = bishfpm_murmur3_64(sub, length, hash_seed);
@@ -825,8 +901,8 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
       if (!entry || (now_ms >= entry->last_trigger_ms &&
                      now_ms - entry->last_trigger_ms >= cooldown_ms))
         continue;
-      double parent_rate = store_query_lower(grp, sub, now_ms);
-      if (parent_rate > 0.0 && candidate_rate < subsumption_ratio * parent_rate)
+      if (subset_suppresses(grp, sub, now_ms, candidate_rate, subsumption_ratio,
+                            conservative))
         return true;
     }
     return false;
@@ -839,9 +915,8 @@ static bool is_candidate_subsumed(bishfpm_group_t *grp,
     }
     if (slot->entry.item_count < subset_len) {
       if (is_pattern_subset(slot->pattern, subset_items, subset_len)) {
-        double parent_rate = store_query_lower(grp, slot->pattern, now_ms);
-        if (parent_rate > 0.0 &&
-            candidate_rate < subsumption_ratio * parent_rate) {
+        if (subset_suppresses(grp, slot->pattern, now_ms, candidate_rate,
+                              subsumption_ratio, conservative)) {
           return true; /* subsumed by active parent pattern */
         }
       }
@@ -900,6 +975,7 @@ typedef struct {
   uint64_t timestamp_ms;
   double group_rate;
   double weight;
+  double omitted_mass;
   bishfpm_trigger_cb cb;
   void *udata;
   int triggered_count;
@@ -909,9 +985,8 @@ typedef struct {
                                        double, uint64_t);
 } bishfpm_eval_ctx_t;
 
-/* A canonical pattern occurs at most once per event. Charge the whole event
- * once even if several gates/updates omit it. Infinity disables evidence for
- * this group if the bound itself can no longer be represented. */
+/* canonical patterns occur at most once per event; infinity disables evidence
+ * for this group if the bound itself overflows */
 static void record_quality_omission(bishfpm_group_t *grp, uint64_t now,
                                     double half_life, double weight) {
   if (weight > 0 && isfinite(grp->quality_omitted.rate) &&
@@ -920,81 +995,117 @@ static void record_quality_omission(bishfpm_group_t *grp, uint64_t now,
     grp->quality_omitted.rate = INFINITY;
 }
 
-static bool partition_lift_suppressed(bishfpm_eval_ctx_t *ctx,
-                                       const char *const *items, size_t order,
-                                       const char *pattern,
-                                       const double *marginals) {
+static bool full_pattern_upper(bishfpm_eval_ctx_t *ctx, topk_result_t update,
+                               const char *pattern, double *out) {
   bishfpm_t *engine = ctx->engine;
-  double threshold = engine->min_partition_lift;
-  bishfpm_alert_quality_stats_t *stats = &engine->alert_quality;
-  stats->candidates_checked++;
   bishfpm_group_t *grp = ctx->grp;
-  store_result_t candidate = grp->store.config->ops->query_text(
-      &grp->store, pattern, ctx->timestamp_ms);
+  double upper;
+  if (!engine->store_config.extension && update.present) {
+    upper = update.upper;
+  } else {
+    store_result_t candidate = grp->store.config->ops->query_text(
+        &grp->store, pattern, ctx->timestamp_ms);
+    if (!candidate.known)
+      return false;
+    upper = candidate.count.upper;
+  }
   double group = ctx->group_rate;
-  if (!candidate.known || !isfinite(candidate.count.upper) ||
-      candidate.count.upper < 0 || !isfinite(group) || group <= 0 ||
-      !isfinite(grp->quality_omitted.rate)) {
-    stats->candidates_unknown++;
+  if (!isfinite(upper) || upper < 0 || !isfinite(group) || group <= 0 ||
+      !isfinite(grp->quality_omitted.rate))
     return false;
-  }
-  double omitted = bishfpm_rate_query(&grp->quality_omitted, ctx->timestamp_ms,
-                                      engine->cfg.ewma_half_life_ms);
-  if (!isfinite(omitted) || omitted < 0) {
-    stats->candidates_unknown++;
-    return false;
-  }
-  /* Certified store bounds cover evaluated history. Gates and rejected
-   * updates can omit occurrences; add their bound without overflowing. */
-  double upper = candidate.count.upper;
-  upper = upper >= group || omitted >= group - upper ? group : upper + omitted;
-
-  unsigned full = (1U << order) - 1;
-  double lower[16] = {0};
-  for (unsigned mask = 1; mask < full; mask++) {
-    size_t count = 0, length = 0;
-    char subset[BISHFPM_MAX_PATTERN_LEN];
-    for (size_t i = 0; i < order; i++) {
-      if (!(mask & (1U << i)))
-        continue;
-      if (count++)
-        subset[length++] = BISHFPM_ITEM_DELIM;
-      size_t n = strlen(items[i]);
-      memcpy(subset + length, items[i], n);
-      length += n;
-      lower[mask] = marginals[i];
+  double omitted = ctx->omitted_mass;
+  if (omitted < 0) {
+    if (!grp->quality_omitted.initialized || grp->quality_omitted.rate <= 0) {
+      omitted = 0;
+    } else {
+      omitted = bishfpm_rate_query(&grp->quality_omitted, ctx->timestamp_ms,
+                                   engine->cfg.ewma_half_life_ms);
+      if (!isfinite(omitted) || omitted < 0)
+        return false;
+      if (omitted == 0)
+        grp->quality_omitted.rate = 0;
     }
-    if (count == 1)
-      continue;
-    lower[mask] = 0;
-    if (count < engine->cfg.min_itemset_order ||
-        count > engine->cfg.max_itemset_order)
-      continue;
-    subset[length] = 0;
-    store_result_t r = grp->store.config->ops->query_text(
-        &grp->store, subset, ctx->timestamp_ms);
-    if (r.known)
-      lower[mask] = r.count.lower;
+    ctx->omitted_mass = omitted;
   }
+  /* certified store bounds cover evaluated history; add omitted-event bound */
+  *out = upper >= group || omitted >= group - upper ? group : upper + omitted;
+  return true;
+}
+
+static double partition_part_lower(const bishfpm_eval_ctx_t *ctx,
+                                   const char *const *items,
+                                   const size_t *lengths,
+                                   const double *marginals, size_t order,
+                                   unsigned mask) {
+  if (!(mask & (mask - 1))) {
+    for (size_t i = 0; i < order; i++)
+      if (mask & (1U << i))
+        return marginals[i];
+    return 0;
+  }
+  size_t bits = 0;
+  for (unsigned m = mask; m; m &= m - 1)
+    bits++;
+  if (bits < ctx->engine->cfg.min_itemset_order ||
+      bits > ctx->engine->cfg.max_itemset_order)
+    return 0;
+  size_t length = 0;
+  char subset[BISHFPM_MAX_PATTERN_LEN];
+  for (size_t i = 0; i < order; i++) {
+    if (!(mask & (1U << i)))
+      continue;
+    if (length)
+      subset[length++] = BISHFPM_ITEM_DELIM;
+    memcpy(subset + length, items[i], lengths[i]);
+    length += lengths[i];
+  }
+  subset[length] = '\0';
+  store_result_t r = ctx->grp->store.config->ops->query_text(
+      &ctx->grp->store, subset, ctx->timestamp_ms);
+  return r.known ? r.count.lower : 0;
+}
+
+static bool partition_lift_suppressed(bishfpm_eval_ctx_t *ctx,
+                                      const char *const *items,
+                                      const size_t *lengths, size_t order,
+                                      topk_result_t update, const char *pattern,
+                                      const double *marginals, int *upper_state,
+                                      double *cached_upper) {
+  bishfpm_t *engine = ctx->engine;
+  bishfpm_partition_lift_stats_t *stats = &engine->partition_lift_stats;
+  stats->candidates_checked++;
+  double upper;
+  if (!full_pattern_upper(ctx, update, pattern, &upper)) {
+    *upper_state = -1;
+    stats->candidates_unknown++;
+    return false;
+  }
+  *upper_state = 1;
+  *cached_upper = upper;
+  double threshold = engine->min_partition_lift;
+  double group = ctx->group_rate;
+  unsigned full = (1U << order) - 1;
   bool unknown = false;
-  /* Fix one item on the left to visit each unordered split exactly once. */
+  /* fix item 0 on the left to visit each unordered two-part split once */
   for (unsigned mask = 1; mask < full; mask += 2) {
-    double parts[] = {lower[mask], lower[full ^ mask]};
-    if (!isfinite(parts[0]) || parts[0] <= 0 || !isfinite(parts[1]) ||
-        parts[1] <= 0) {
+    double p0 =
+        partition_part_lower(ctx, items, lengths, marginals, order, mask);
+    if (!isfinite(p0) || p0 <= 0) {
       unknown = true;
       continue;
     }
+    double p1 = partition_part_lower(ctx, items, lengths, marginals, order,
+                                     full ^ mask);
+    if (!isfinite(p1) || p1 <= 0) {
+      unknown = true;
+      continue;
+    }
+    double parts[] = {p0, p1};
     double score = upper > 0 ? compute_subset_lift(2, upper, group, parts) : 0;
-    /* Keep equality and near-boundary floating-point results eligible. */
-    score = nextafter(score, INFINITY);
-    if (score < threshold &&
-        threshold - score > 64 * DBL_EPSILON * threshold) {
+    if (conservatively_below(score, threshold)) {
       stats->candidates_suppressed++;
       return true;
     }
-    if (isnan(score))
-      unknown = true;
   }
   if (unknown)
     stats->candidates_unknown++;
@@ -1033,20 +1144,38 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
     }
   }
 
+  int upper_state = 0;
+  double cached_upper = 0;
   if (ctx->engine->min_partition_lift > 0 && subset_len >= 3 &&
       subset_len <= 4 &&
-      partition_lift_suppressed(ctx, subset_items, subset_len, pattern,
-                                marginals)) {
+      partition_lift_suppressed(ctx, subset_items, item_lengths, subset_len,
+                                update, pattern, marginals, &upper_state,
+                                &cached_upper)) {
     ctx->engine->stats.triggers_suppressed++;
     return;
   }
 
   /* check subsumption by active subset alerts */
-  if (is_candidate_subsumed(
-          ctx->grp, subset_items, subset_len, p_rate, ctx->timestamp_ms,
-          ctx->engine->cfg.trigger_cooldown_ms,
-          ctx->engine->cfg.subsumption_ratio,
-          ctx->engine->cfg.min_itemset_order, ctx->engine->cfg.hash_seed)) {
+  bool conservative = conservative_subsumption_enabled(ctx->engine);
+  double subsumption_rate = p_rate;
+  bool evidence_known = true;
+  if (conservative && subset_len > ctx->engine->cfg.min_itemset_order &&
+      ctx->grp->cooldown_count) {
+    if (upper_state == 0)
+      evidence_known =
+          full_pattern_upper(ctx, update, pattern, &subsumption_rate);
+    else {
+      evidence_known = upper_state > 0;
+      subsumption_rate = cached_upper;
+    }
+  }
+  if (evidence_known &&
+      is_candidate_subsumed(ctx->grp, subset_items, item_lengths, subset_len,
+                            subsumption_rate, ctx->timestamp_ms,
+                            ctx->engine->cfg.trigger_cooldown_ms,
+                            ctx->engine->cfg.subsumption_ratio,
+                            ctx->engine->cfg.min_itemset_order,
+                            ctx->engine->cfg.hash_seed, conservative)) {
     ctx->engine->stats.triggers_suppressed++;
     return; /* subsumed by active parent pattern */
   }
@@ -1108,8 +1237,9 @@ static void notify_candidate(bishfpm_eval_ctx_t *ctx,
  * append each prefix once per order, preserving lexicographic enumeration */
 static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
                                   size_t target, size_t start, size_t depth,
-                                  const char **items, double *marginals,
-                                  char *pattern, size_t length) {
+                                  const char **items, size_t *lengths,
+                                  double *marginals, char *pattern,
+                                  size_t length) {
   if (depth == target) {
     pattern[length] = 0;
     topk_result_t update;
@@ -1138,14 +1268,16 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
         p->filtered_updates++;
       p->replacements += update.replaced;
     }
-    if (ctx->engine->min_partition_lift > 0 && depth >= 3 && depth <= 4 &&
-        ctx->weight > 0 && !update.accepted && !ctx->quality_omitted_event) {
+    if (!update.accepted && ctx->weight > 0 && !ctx->quality_omitted_event &&
+        depth >= ctx->engine->quality_min_order &&
+        depth <= ctx->engine->quality_max_order) {
       record_quality_omission(ctx->grp, ctx->timestamp_ms,
-                               ctx->engine->cfg.ewma_half_life_ms, ctx->weight);
+                              ctx->engine->cfg.ewma_half_life_ms, ctx->weight);
       ctx->quality_omitted_event = true;
+      ctx->omitted_mass = -1;
     }
     if (candidate_promoted(ctx, depth, update))
-      notify_candidate(ctx, items, NULL, depth, update, pattern, length, 0,
+      notify_candidate(ctx, items, lengths, depth, update, pattern, length, 0,
                        update.hash, marginals);
     return;
   }
@@ -1157,9 +1289,10 @@ static void evaluate_combinations(bishfpm_eval_ctx_t *ctx, size_t count,
     const prepared_item_t *item = &ctx->event->items[i];
     size_t item_length = item->length;
     items[depth] = item->key;
+    lengths[depth] = item_length;
     marginals[depth] = item->marginal;
     memcpy(pattern + pos, item->key, item_length);
-    evaluate_combinations(ctx, count, target, i + 1, depth + 1, items,
+    evaluate_combinations(ctx, count, target, i + 1, depth + 1, items, lengths,
                           marginals, pattern, pos + item_length);
   }
 }
@@ -1369,7 +1502,7 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
   engine->stats.events_accepted++;
   double group_rate = bishfpm_rate_update_weighted(
       &grp->group_rate, now, engine->cfg.ewma_half_life_ms, effective_weight);
-  if (engine->min_partition_lift > 0 && effective_weight > 0 &&
+  if (engine->quality_max_order != 0 && effective_weight > 0 &&
       !(group_rate > 0))
     grp->quality_omitted.rate = INFINITY;
   size_t elevated = 0;
@@ -1389,14 +1522,12 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
     }
   }
 
-  bool quality_omitted_event =
-      engine->min_partition_lift > 0 && effective_weight > 0 &&
-      engine->cfg.max_itemset_order >= 3 &&
-      engine->cfg.min_itemset_order <= 4 && event->count >= 3 &&
-      event->count >= engine->cfg.min_itemset_order && elevated < event->count;
+  bool quality_omitted_event = effective_weight > 0 &&
+                               elevated < event->count &&
+                               event->count >= engine->quality_min_order;
   if (quality_omitted_event)
     record_quality_omission(grp, now, engine->cfg.ewma_half_life_ms,
-                             effective_weight);
+                            effective_weight);
   event->count = elevated;
   result = 0;
   if (elevated >= engine->cfg.min_itemset_order) {
@@ -1410,6 +1541,7 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
         now,
         group_rate,
         effective_weight,
+        -1,
         cb,
         udata,
         0,
@@ -1449,11 +1581,12 @@ int bishfpm_add_event_weighted(bishfpm_t *engine, const char *group_key,
         }
     } else {
       const char *sub_items[BISHFPM_MAX_ITEMSET_ORDER];
+      size_t item_lengths[BISHFPM_MAX_ITEMSET_ORDER];
       double marginals[BISHFPM_MAX_ITEMSET_ORDER];
       char pattern[BISHFPM_MAX_PATTERN_LEN];
       for (size_t k = engine->cfg.min_itemset_order; k <= max_k; k++)
-        evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, marginals,
-                              pattern, 0);
+        evaluate_combinations(&ctx, elevated, k, 0, 0, sub_items, item_lengths,
+                              marginals, pattern, 0);
     }
     result = ctx.triggered_count;
   }
@@ -1644,6 +1777,12 @@ static void prune_group(bishfpm_t *engine, bishfpm_group_t *group,
   group->max_time_ms = effective;
   group->group_rate.rate = gr;
   group->group_rate.last_time_ms = effective;
+  if (group->quality_omitted.initialized &&
+      isfinite(group->quality_omitted.rate)) {
+    group->quality_omitted.rate = bishfpm_rate_query(
+        &group->quality_omitted, effective, engine->cfg.ewma_half_life_ms);
+    group->quality_omitted.last_time_ms = effective;
+  }
   size_t ip =
       engine->numeric_pairs
           ? prune_numeric_marginals(group->item_rates, effective,

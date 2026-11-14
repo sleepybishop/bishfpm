@@ -202,40 +202,63 @@ static void memory_accounting(void) {
   }
 }
 static void subsumption_probe_equivalence(void) {
-  const char *patterns[] = {"a\037b", "a\037c", "b\037c", "d\037e", "a\037bb"};
+  const char *patterns[] = {"a\037b",  "a\037c", "b\037c", "d\037e",
+                            "a\037bb", "p\037q", "r\037s"};
   const char *candidates[][3] = {
       {"a", "b", "c"}, {"a", "bb", "c"}, {"a", "d", "e"}, {"x", "y", "z"}};
   for (unsigned seeded = 0; seeded < 2; seeded++) {
     uint64_t seed = seeded ? UINT64_C(0xfedcba9876543210) : 0;
-    bishfpm_group_t g = group(16);
+    bishfpm_group_t g = group(16), crowded = group(16);
     g.store.state.text = bishfpm_topk_new(16, 1000);
-    assert(g.store.state.text);
+    crowded.store.state.text = bishfpm_topk_new(16, 1000);
+    assert(g.store.state.text && crowded.store.state.text);
     bishfpm_topk_set_seed(g.store.state.text, seed);
+    bishfpm_topk_set_seed(crowded.store.state.text, seed);
     bool saturated = false;
     for (size_t i = 0; i < sizeof(patterns) / sizeof(*patterns); i++) {
-      assert(bishfpm_topk_add(g.store.state.text, patterns[i], 10 + i, 1000) >
-             0);
-      assert(!check_and_update_cooldown(&g, bishfpm_hash_str(patterns[i], seed),
-                                        patterns[i], 2, 1000 + i * 10, 100,
-                                        &saturated));
+      uint64_t h = bishfpm_hash_str(patterns[i], seed);
+      if (i < 5) {
+        assert(bishfpm_topk_add(g.store.state.text, patterns[i], 10 + i, 1000) >
+               0);
+        assert(!check_and_update_cooldown(&g, h, patterns[i], 2, 1000 + i * 10,
+                                          100, &saturated));
+      }
+      assert(bishfpm_topk_add(crowded.store.state.text, patterns[i], 10 + i,
+                              1000) > 0);
+      assert(!check_and_update_cooldown(&crowded, h, patterns[i], 2,
+                                        1000 + i * 10, 100, &saturated));
     }
     for (unsigned pruned = 0; pruned < 2; pruned++) {
-      if (pruned)
+      if (pruned) {
         assert(bishfpm_topk_prune(g.store.state.text, 1000, 12) == 2);
+        assert(bishfpm_topk_prune(crowded.store.state.text, 1000, 12) == 2);
+      }
       for (uint64_t now = 990; now <= 1140; now += 10) {
         for (size_t candidate = 0; candidate < 4; candidate++) {
+          size_t lengths[3] = {strlen(candidates[candidate][0]),
+                               strlen(candidates[candidate][1]),
+                               strlen(candidates[candidate][2])};
           for (unsigned rate = 0; rate < 20; rate++) {
-            bool scan = is_candidate_subsumed(&g, candidates[candidate], 3,
-                                              rate, now, 100, .85, 1, seed);
-            bool probes = is_candidate_subsumed(&g, candidates[candidate], 3,
-                                                rate, now, 100, .85, 2, seed);
-            assert(scan == probes);
+            for (unsigned conservative = 0; conservative < 2; conservative++) {
+              bool scan = is_candidate_subsumed(&g, candidates[candidate], NULL,
+                                                3, rate, now, 100, .85, 1, seed,
+                                                conservative != 0);
+              bool probes = is_candidate_subsumed(
+                  &g, candidates[candidate], lengths, 3, rate, now, 100, .85, 2,
+                  seed, conservative != 0);
+              bool min1_probes = is_candidate_subsumed(
+                  &crowded, candidates[candidate], NULL, 3, rate, now, 100, .85,
+                  1, seed, conservative != 0);
+              assert(scan == probes && scan == min1_probes);
+            }
           }
         }
       }
     }
     bishfpm_topk_free(g.store.state.text);
+    bishfpm_topk_free(crowded.store.state.text);
     release(&g);
+    release(&crowded);
   }
 }
 
